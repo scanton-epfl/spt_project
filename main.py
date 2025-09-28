@@ -1,13 +1,18 @@
+import torch
 from helpers.simulation import * # Functions to create trajectory data and their respective video frames
+from helpers.models import *
 
 def main():
     # Define model hyperparameters
+    D_max_normalization = 10
+    lr = 1e-4
     patch_size = 9
     embed_dim = 64
     num_heads = 4
     hidden_dim = 128
     num_layers = 6
     dropout = 0.0
+    batch_size = 16
 
 
     # Image generation parameters
@@ -48,7 +53,7 @@ def main():
     T = nPosFrame*nFrame
 
     # Number of cycles of generating training data and training
-    cycles = 1 # 100
+    cycles = 100
 
 
     # Training cycles -> one epoch but we generate training data in smaller batches
@@ -56,13 +61,17 @@ def main():
 
         # Create training data
         all_videos, all_labels = create_training_set(N, T, image_props)
-
+        
+        # Normalize labels for better optimization
+        all_labels = all_labels / D_max_normalization
         
         # Convert to tensors
-        ...
+        all_videos = torch.Tensor(all_videos)
+        all_labels = torch.Tensor(all_labels)
 
         # Create dataset and dataloader objects
-        ...
+        dataset = VideoDataset(all_videos, all_labels)
+        dataloader = DataLoader(dataset, batch_size=batch_size, shuffle=True)
 
         # Train
 
