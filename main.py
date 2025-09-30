@@ -1,10 +1,15 @@
 import torch
 from helpers.simulation import * # Functions to create trajectory data and their respective video frames
 from helpers.models import *
+from torch.optim import AdamW
 
 def main():
+    # Define model run type
+    base_run = True
+
     # Define model hyperparameters
     D_max_normalization = 10
+    angle_max_normalization = np.pi
     lr = 1e-4
     patch_size = 9
     embed_dim = 64
@@ -47,7 +52,7 @@ def main():
         "trajectory_unit" : 1200
     }
     # Simulation settings
-    N = 1
+    N = 500
     nPosFrame = 10
     nFrame = 30
     T = nPosFrame*nFrame
@@ -55,6 +60,15 @@ def main():
     # Number of cycles of generating training data and training
     cycles = 100
 
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    print("Using device:", device)
+
+    # Define model
+    model = DiffusionTensorRegModelBase(embed_dim, num_heads, hidden_dim, num_layers, dropout)
+    optimizer = AdamW(model.parameters(), lr)
+    #scheduler = 
+
+    model.to(device)
 
     # Training cycles -> one epoch but we generate training data in smaller batches
     for i in range(cycles):
@@ -63,7 +77,7 @@ def main():
         all_videos, all_labels = create_training_set(N, T, image_props)
         
         # Normalize labels for better optimization
-        all_labels = all_labels / D_max_normalization
+        all_labels = all_labels / np.array([D_max_normalization, D_max_normalization, angle_max_normalization])
         
         # Convert to tensors
         all_videos = torch.Tensor(all_videos)
@@ -74,7 +88,18 @@ def main():
         dataloader = DataLoader(dataset, batch_size=batch_size, shuffle=True)
 
         # Train
+        for videos, labels in dataloader:
+            videos = videos.to(device)
+            labels = labels.to(device)
 
+            optimizer.zero_grad()
+
+            output = model(videos)
+
+            loss = log_euclidean_loss(labels, output)
+            
+            loss.backward()
+            optimizer.step()
 
 if __name__ == '__main__':
    main()
