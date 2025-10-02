@@ -62,10 +62,10 @@ def create_training_set(N: int, T: int, image_props: dict, dt: int=1, fov: np.nd
         T (int): integer representing the number of timesteps for each simulation 
          
     Returns:
-        videos: list[list[np.ndarray(image_size)]] 
-                    list of images for each trajectory
-        labels: list[list[lambda_1, lambda_2, theta]]
-                    list of labels for each trajectory generated
+        videos: np.ndarray 
+                    Array of images for each trajectory
+        labels: np.ndarray
+                    Array of labels for each trajectory generated
     """
     
     # Generate random diffusion parameters
@@ -89,6 +89,48 @@ def create_training_set(N: int, T: int, image_props: dict, dt: int=1, fov: np.nd
     
     return videos, labels
 
+def create_training_set_w_features(N: int, T: int, image_props: dict, dt: int=1, fov: np.ndarray | None=None) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """
+    Creates new training data containing video frames of trajectories and labels for a given cycle of training
+
+    Args:
+        N (int): integer representing the number of trajectories to generate in a simulation
+        T (int): integer representing the number of timesteps for each simulation 
+         
+    Returns:
+        videos: np.ndarray 
+                    Array of images for each trajectory
+        displacements: np.ndarray
+                    Array of displacements between each pair of frames
+        labels: np.ndarray
+                    Array of labels for each trajectory generated
+    """
+    
+    # Generate random diffusion parameters
+    p1 = np.random.randint(1, 11, size=N)
+    alpha = np.random.uniform(0.1, 1, size=N)
+    p2 = alpha*p1
+    theta = np.random.uniform(0, np.pi, size=N)
+
+    if fov is None:
+        fov = np.array([128,128])
+        
+    # Create trajectories
+    pos = create_trajectories(p1, p2, theta, fov, N, T, dt)
+    
+    # Get labels
+    labels = np.stack((p1,p2,theta), axis=-1) # shape: (N,3)
+
+    # Convert trajectories of D (pixels^2/s) to D (micro_m^2/ms)
+    scaled_pos = pos / 100
+    videos, centroids = trajectories_to_videos_and_centroids(scaled_pos, image_props)
+
+    # Calculate relative displacement using centroids
+    _, nFrames, _ = centroids.shape
+    displacement = centroids[:, 1:, :] - centroids [:, :nFrames-1, :]
+    
+    return videos, displacement, labels
+
 def gaussian_2d(xc, yc, sigma, grid_size, amplitude):
     """
     Generates a 2D Gaussian point spread function (PSF) centered at a specified position.
@@ -111,10 +153,37 @@ def gaussian_2d(xc, yc, sigma, grid_size, amplitude):
     gauss = amplitude * np.exp(-(((x - xc) ** 2) / (2 * sigma ** 2) + ((y - yc) ** 2) / (2 * sigma ** 2)))
     return gauss
 
+def get_props(T: int, image_props: dict) -> tuple:
+    """
+    Fetch image props from dictionary
+    """
+    nFrames = image_props['frames']
+
+    resolution =image_props["resolution"]
+    traj_unit = image_props["trajectory_unit"]
+
+    output_size = image_props["output_size"]
+    upsampling_factor = image_props["upsampling_factor"]
+    psf_div_factor = image_props["psf_division_factor"]
+    
+    # Psf is computed as wavelenght/2NA according to:
+    #https://www.sciencedirect.com/science/article/pii/S0005272819301380?via%3Dihub
+    fwhm_psf = image_props["wavelength"] / 2 * image_props["NA"] / psf_div_factor
+
+    
+    gaussian_sigma = upsampling_factor/ resolution * fwhm_psf/2.355
+    poisson_noise = image_props["poisson_noise"]
+    
+    particle_mean, particle_std = image_props["particle_intensity"][0],image_props["particle_intensity"][1]
+    background_mean, background_std = image_props["background_intensity"][0],image_props["background_intensity"][1]
+    nPosPerFrame = image_props['n_pos_per_frame']
+
+    return (nFrames, traj_unit, resolution, output_size, gaussian_sigma, poisson_noise, 
+        particle_mean, particle_std, background_mean, background_std, nPosPerFrame, upsampling_factor) 
 
 def trajectories_to_videos(pos: np.ndarray, image_props: dict) -> np.ndarray:
     """
-    Transforms trajectory data into microscopy imagery data
+    Transforms trajectory data into microscopy imagery data and centroid data
 
     Args:
         pos: np.ndarray (N,T,2)
@@ -124,7 +193,7 @@ def trajectories_to_videos(pos: np.ndarray, image_props: dict) -> np.ndarray:
         image_props: dict
             Dictionary containing the properties needed for image creation
     Returns:
-        videos: np.ndarray (N, T/nPosPerFrame, width, height)
+        videos: np.ndarray (N, nFrames, output_size, output_size)
 
     Andi simulation code 128x128 px^2 fov, dt=0.1s, D in px^2/frame, resolution of 100nm per pixel, D on the order of 0.01 um^2/s -> pixel size and framerate tell us D=0.1 px^2/ dt
     """
@@ -134,53 +203,15 @@ def trajectories_to_videos(pos: np.ndarray, image_props: dict) -> np.ndarray:
     # Invert the y axis, for video creation purposes where y-axis is inverted
     pos[:, :, 1] *= -1
 
-
-    nFrames = T // image_props['frames']
-
-    _image_dict = {
-        "particle_intensity": [
-            500,
-            20,
-        ],  # Mean and standard deviation of the particle intensity
-        "NA": 1.46,  # Numerical aperture
-        "wavelength": 500e-9,  # Wavelength
-        "psf_division_factor": 1, 
-        "resolution": 100e-9,  # Camera resolution or effective resolution in nm, aka pixelsize
-        "output_size": 32,
-        "upsampling_factor": 5,
-        "background_intensity": [
-            100,
-            10,
-        ],  # Standard deviation of background intensity within a video
-        "poisson_noise": 100,
-        "trajectory_unit" : 100
-    }
-
-    # Update the dictionaries with the user-defined values
-    _image_dict.update(image_props)
-    resolution =_image_dict["resolution"]
-    traj_unit = _image_dict["trajectory_unit"]
+    # Get imaging properties
+    (nFrames, traj_unit, resolution, output_size, gaussian_sigma, poisson_noise, 
+        particle_mean, particle_std, background_mean, background_std, nPosPerFrame, upsampling_factor) = get_props(T, image_props)
     
     if(traj_unit !=-1 ):
         # put the trajectory in pixels
         pos = pos * traj_unit / (resolution* 1e9)
 
-    output_size = _image_dict["output_size"]
-    upsampling_factor = _image_dict["upsampling_factor"]
-    psf_div_factor = _image_dict["psf_division_factor"]
-    
-    # Psf is computed as wavelenght/2NA according to:
-    #https://www.sciencedirect.com/science/article/pii/S0005272819301380?via%3Dihub
-    fwhm_psf = _image_dict["wavelength"] / 2 * _image_dict["NA"] / psf_div_factor
-
-    
-    gaussian_sigma = upsampling_factor/ resolution * fwhm_psf/2.355
-    poisson_noise = _image_dict["poisson_noise"]
-    
     out_videos = np.zeros((N,nFrames,output_size,output_size),np.float32)
-    particle_mean, particle_std = _image_dict["particle_intensity"][0],_image_dict["particle_intensity"][1]
-    background_mean, background_std = _image_dict["background_intensity"][0],_image_dict["background_intensity"][1]
-    nPosPerFrame = _image_dict['n_pos_per_frame']
 
     # n is for indexing the particle
     for n in range(N):
@@ -191,8 +222,51 @@ def trajectories_to_videos(pos: np.ndarray, image_props: dict) -> np.ndarray:
     
     return videos
 
-def generate_video(out_video, trajectory, nFrames, output_size, upsampling_factor, nPosPerFrame, 
-                   gaussian_sigma, particle_mean, particle_std, background_mean, background_std, poisson_noise):
+def trajectories_to_videos_and_centroids(pos: np.ndarray, image_props: dict) -> tuple[np.ndarray, np.ndarray]:
+    """
+    Transforms trajectory data into microscopy imagery data and centroid data
+
+    Args:
+        pos: np.ndarray (N,T,2)
+            Trajectory data for N particles across T timesteps in x,y dimensions
+        nPosPerFrame: int
+            The number of trajectory points used to create one frame
+        image_props: dict
+            Dictionary containing the properties needed for image creation
+    Returns:
+        videos: np.ndarray (N, nFrames, output_size, output_size)
+        centroids: np.ndarray (N, nFrames, 2)
+
+    Andi simulation code 128x128 px^2 fov, dt=0.1s, D in px^2/frame, resolution of 100nm per pixel, D on the order of 0.01 um^2/s -> pixel size and framerate tell us D=0.1 px^2/ dt
+    """
+    # Get trajectory dimensions
+    N, T, _ = pos.shape
+    
+    # Invert the y axis, for video creation purposes where y-axis is inverted
+    pos[:, :, 1] *= -1
+
+    # Get imaging properties
+    (nFrames, traj_unit, resolution, output_size, gaussian_sigma, poisson_noise, 
+        particle_mean, particle_std, background_mean, background_std, nPosPerFrame, upsampling_factor) = get_props(T, image_props)
+
+    if(traj_unit !=-1 ):
+        # put the trajectory in pixels
+        pos = pos * traj_unit / (resolution* 1e9)
+    
+    out_videos = np.zeros((N,nFrames,output_size,output_size),np.float32)
+    centroids = np.zeros((N, nFrames, 2))
+
+    # n is for indexing the particle
+    for n in range(N):
+        generate_video(out_videos[n,:],pos[n,:],nFrames,output_size,upsampling_factor,nPosPerFrame,
+                                            gaussian_sigma,particle_mean,particle_std,background_mean,background_std, poisson_noise,centroids[n,:])
+    
+    videos = normalize_images(out_videos, background_mean, background_std, particle_mean + background_mean)
+    
+    return videos, centroids
+
+def generate_video(out_video: np.ndarray, trajectory: np.ndarray, nFrames: int, output_size: int, upsampling_factor: int, nPosPerFrame: int, 
+                   gaussian_sigma: float, particle_mean: float, particle_std: float, background_mean: float, background_std: float, poisson_noise: float, centroid: np.ndarray | None=None):
     """Helper function of function above, all arguments documented above"""
     for f in range(nFrames):
         frame_hr = np.zeros(( output_size*upsampling_factor, output_size*upsampling_factor),np.float32)
@@ -201,7 +275,8 @@ def generate_video(out_video, trajectory, nFrames, output_size, upsampling_facto
         start = f*nPosPerFrame
         end = (f+1)*nPosPerFrame
         # Center the trajectory data across a segment of nPosPerFrame
-        trajectory_segment = trajectory[start:end,:] - np.mean(trajectory[start:end,:],axis=0)  
+        mean = np.mean(trajectory[start:end,:],axis=0)  
+        trajectory_segment = trajectory[start:end,:] - mean
         xtraj = trajectory_segment[:,0]  * upsampling_factor
         ytraj = trajectory_segment[:,1] * upsampling_factor
 
@@ -231,8 +306,26 @@ def generate_video(out_video, trajectory, nFrames, output_size, upsampling_facto
             frame_lr = frame_lr * np.random.poisson(poisson_noise, size=(frame_lr.shape)) / poisson_noise
 
         out_video[f,:] = frame_lr
+        # Case where we want features for relative motion between frames
+        if centroid is not None:    
+            centroid[f,:] = get_image_centroid(frame_lr, output_size) + mean
 
-def normalize_images(images: np.ndarray, background_mean=None, background_sigma=None, theoretical_max=None):
+def get_image_centroid(image: np.ndarray, grid_size: int) -> np.ndarray:
+    """
+    Compute the intensity centroid of an image
+    """
+    # Get grid with center (0,0)
+    limit = (grid_size - 1) // 2
+    x = np.linspace(-limit, limit, grid_size)
+    y = np.linspace(-limit, limit, grid_size)
+    coords = np.stack(np.meshgrid(x, y), axis=-1) # (grid_size, grid_size, 2)
+
+    # Compute intensity centroid
+    total_intensity = np.sum(image)
+    
+    return np.sum(coords*image[:,:,None], axis=(0,1)) / total_intensity
+
+def normalize_images(images: np.ndarray, background_mean=None, background_sigma=None, theoretical_max=None) -> np.ndarray:
     """
     Normalize images according to the formula:
     im_norm = (im - (background_mean - background_sigma)) / (theoretical_max - (background_mean - background_sigma))

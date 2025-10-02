@@ -1,4 +1,3 @@
-from typing import Any
 import torch
 import torch.nn as nn
 from torch.utils.data import Dataset, DataLoader
@@ -19,19 +18,22 @@ class VideoDataset(Dataset):
     def __len__(self) -> int:
         return len(self.labels)
 
-    def __getitem__(self, idx: int) -> tuple[torch.Tensor, torch.Tensor]:
-        return self.videos[idx], self.labels[idx]
+    def __getitem__(self, idx: int) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        return self.videos[idx], torch.Tensor(), self.labels[idx]
 
 class VideoMotionDataset(VideoDataset):
     """
-    Dataset object for video and relative motion between frames data
+    Dataset object for video and relative displacement between frames data
     """
-    def __init__(self, videos: torch.Tensor, motion: torch.Tensor, labels: torch.Tensor):
+    def __init__(self, videos: torch.Tensor, displacement: torch.Tensor, labels: torch.Tensor):
         super().__init__(videos, labels)
-        self.motion = motion
+        # Add zero displacement to front of each sequence in batch to match dimension with image sequences
+        batch_size, _, _ = displacement.shape
+        zeros = torch.zeros(batch_size, 1, 2)
+        self.displacement = torch.cat((zeros, displacement), dim=1) # (batch_size, nFrames, 2)
     
     def __getitem__(self, idx: int) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        return self.videos[idx], self.motion[idx], self.labels[idx]
+        return self.videos[idx], self.displacement[idx], self.labels[idx]
     
 class MultiheadAttention(nn.Module):
     """
@@ -269,6 +271,38 @@ class DeepResNetEmbedding(nn.Module):
         x = x.view(batch_size, num_images, -1)  # Reshape back: (B, num_images, 128)
         
         return self.fc(x)  # Final projection to embed_dim
+    
+class MLP(nn.Module):
+    """
+    General MLP
+    """
+    def __init__(self, input_dim: int=2, hidden_dim: int=128, num_layers: int=2, output_dim: int=32, dropout: float=0.0):
+        super().__init__()
+        
+        layers = []
+        # First layer
+        layers.append(nn.Linear(input_dim, hidden_dim))
+        layers.append(nn.ReLU())
+        if dropout > 0:
+            layers.append(nn.Dropout(dropout))
+
+        # Hidden layers
+        for _ in range(num_layers-2):
+            layers.append(nn.Linear(hidden_dim, hidden_dim))
+            layers.append(nn.ReLU())
+            if dropout > 0:
+                layers.append(nn.Dropout(dropout))
+            
+        # Output layer
+        if num_layers > 1:
+            layers.append(nn.Linear(hidden_dim, output_dim))
+        else:
+            layers.append(nn.Linear(input_dim, output_dim))
+        
+        self.mlp = nn.Sequential(*layers)
+
+    def forward(self, x: torch.Tensor):
+        return self.mlp(x)
 
 class DiffusionTensorRegModelBase(nn.Module):
     """
@@ -313,7 +347,61 @@ class DiffusionTensorRegModelBase(nn.Module):
         predictions = self.mlp(cls_tokens)
 
         return predictions
-    
+
+class DiffusionTensorRegModel(DiffusionTensorRegModelBase):
+    def __init__(self, embed_dim: int, num_heads: int, hidden_dim: int, num_layers: int, 
+                 dropout: float, feat_dim: int=8, use_pos_encoding: bool=False, use_concat: bool=True, use_sum: bool=False):
+        super().__init__(embed_dim, num_heads, hidden_dim, num_layers, dropout, use_pos_encoding)
+        
+        # Method for combining
+        self.use_sum = use_sum
+        
+        # Encoder for displacement data
+        if use_sum:
+            self.disp_encoder = MLP(input_dim=2, hidden_dim=hidden_dim, num_layers=2, output_dim=embed_dim)
+            # Class token used for regression
+            self.cls = nn.Parameter(torch.randn(1,1,embed_dim))
+        else:
+            self.disp_encoder = MLP(input_dim=2, hidden_dim=hidden_dim, num_layers=2, output_dim=feat_dim)
+            # Class token used for regression
+            self.cls = nn.Parameter(torch.randn(1,1,embed_dim+feat_dim))
+            embed_dim += feat_dim
+
+        # Instantiate transformer encoder
+        self.transformer = Transformer(embed_dim, num_heads, hidden_dim, num_layers, dropout, use_pos_encoding)
+
+        # Instantiate regression head
+        self.mlp = RegressionHead(embed_dim, hidden_dim, dropout=dropout)
+
+    def forward(self, x: torch.Tensor, disp: torch.Tensor):
+        # Get encoded videos
+        encoded_images = self.image_encoder(x) # (batch_size, num_frames, embed_dim)
+
+        # Normalize for input to the model
+        encoded_images = self.norm(encoded_images)
+
+        # Get encoded displacement vectors
+        encoded_disp = self.disp_encoder(disp) # (batch_size, num_frames, output_dim)
+        # Combine image and displacement data
+        if self.use_sum:
+            encoded = encoded_images + encoded_disp
+        else:
+            encoded = torch.cat((encoded_images, encoded_disp), dim=-1)
+
+        # Get input for transformer by combining cls token with image sequences
+        batch_size, _, _ = encoded.shape
+        cls_token = self.cls.expand(batch_size, -1, -1)
+        tokens = torch.cat((cls_token, encoded), dim=1) # (batch_size, num_frames + 1, embed_dim)
+
+        # Pass through transformer
+        output = self.transformer(tokens)
+
+        # Pass cls representations to regression head
+        cls_tokens = output[:, 0, :]
+        predictions = self.mlp(cls_tokens)
+
+        return predictions        
+
 def construct_matrix_log(log_p1: torch.Tensor, log_p2: torch.Tensor, theta: torch.Tensor) -> torch.Tensor:
     """
     Construct matrix log from log(eigenvalues) and angles
@@ -373,7 +461,7 @@ def log_euclidean_loss(labels: torch.Tensor, predictions: torch.Tensor) -> torch
 
     # Compute matrix log for predictions and labels
     mlog_pred = construct_matrix_log(p1_pred, p2_pred, theta_pred)
-    mlog_label = construct_matrix_log(p1_label, p2_label, theta_label)
+    mlog_label = construct_matrix_log(torch.log(p1_label), torch.log(p2_label), theta_label)
 
     # Compute loss across batch w/ Frobenious norm
     loss = ((mlog_pred - mlog_label)**2).sum(dim=(1,2)).mean()
