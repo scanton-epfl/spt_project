@@ -382,6 +382,7 @@ class DiffusionTensorRegModel(DiffusionTensorRegModelBase):
 
         # Get encoded displacement vectors
         encoded_disp = self.disp_encoder(disp) # (batch_size, num_frames, output_dim)
+        
         # Combine image and displacement data
         if self.use_sum:
             encoded = encoded_images + encoded_disp

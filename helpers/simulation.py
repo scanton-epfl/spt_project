@@ -213,7 +213,6 @@ def trajectories_to_videos(pos: np.ndarray, image_props: dict) -> np.ndarray:
 
     out_videos = np.zeros((N,nFrames,output_size,output_size),np.float32)
 
-    # n is for indexing the particle
     for n in range(N):
         generate_video(out_videos[n,:],pos[n,:],nFrames,output_size,upsampling_factor,nPosPerFrame,
                                             gaussian_sigma,particle_mean,particle_std,background_mean,background_std, poisson_noise)
@@ -256,7 +255,6 @@ def trajectories_to_videos_and_centroids(pos: np.ndarray, image_props: dict) -> 
     out_videos = np.zeros((N,nFrames,output_size,output_size),np.float32)
     centroids = np.zeros((N, nFrames, 2))
 
-    # n is for indexing the particle
     for n in range(N):
         generate_video(out_videos[n,:],pos[n,:],nFrames,output_size,upsampling_factor,nPosPerFrame,
                                             gaussian_sigma,particle_mean,particle_std,background_mean,background_std, poisson_noise,centroids[n,:])
@@ -313,6 +311,14 @@ def generate_video(out_video: np.ndarray, trajectory: np.ndarray, nFrames: int, 
 def get_image_centroid(image: np.ndarray, grid_size: int) -> np.ndarray:
     """
     Compute the intensity centroid of an image
+
+    Args:
+        image: np.ndarray
+            Input image to find intensity centroid of
+        grid_size: int
+            Size of grid/image
+    Returns:
+        Centroid of image intensity
     """
     # Get grid with center (0,0)
     limit = (grid_size - 1) // 2

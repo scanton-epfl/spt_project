@@ -131,8 +131,8 @@ def train_single_mode(model: DiffusionTensorRegModelBase, N: int, T: int, props:
 
 def main():
     # Define model run type
-    use_rel_displacement_features = False
-    use_sum=True
+    use_rel_displacement_features = True
+    use_sum=False
 
     # Define model parameters
     model_props= {
@@ -145,7 +145,7 @@ def main():
         "num_layers": 6,
         "dropout": 0.0,
         "batch_size": 16,
-        "disp_feat_dim": 8
+        "disp_feat_dim": 4
     }
 
     # Image parameters
@@ -174,7 +174,7 @@ def main():
             background_mean,
             background_sigma,
         ],  # Standard deviation of background intensity within a video
-        "poisson_noise": -1, #100,
+        "poisson_noise": 100,
         "trajectory_unit" : 1200
     }
 
