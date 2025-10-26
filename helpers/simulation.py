@@ -1,9 +1,6 @@
 import numpy as np
 from skimage.measure import block_reduce
 
-def get_random_diffusion_params():
-    pass
-
 def create_trajectories(p1: np.ndarray, p2: np.ndarray, theta: np.ndarray, fov: np.ndarray, N: int, T: int, dt: int):
     """
     Create array of trajectories given diffusion parameters
@@ -67,12 +64,11 @@ def create_training_set(N: int, T: int, image_props: dict, dt: int=1, fov: np.nd
         labels: np.ndarray
                     Array of labels for each trajectory generated
     """
-    
     # Generate random diffusion parameters
-    p1 = np.random.randint(1, 11, size=N)
+    p1 = np.random.randint(image_props['D_min'], image_props['D_max']+1, size=N)
     alpha = np.random.uniform(0.1, 1, size=N)
     p2 = alpha*p1
-    theta = np.random.uniform(0, np.pi, size=N)
+    theta = np.random.uniform(0, image_props['angle_max'], size=N)
 
     if fov is None:
         fov = np.array([128,128])
@@ -105,19 +101,18 @@ def create_training_set_w_features(N: int, T: int, image_props: dict, dt: int=1,
         labels: np.ndarray
                     Array of labels for each trajectory generated
     """
-    
     # Generate random diffusion parameters
-    p1 = np.random.randint(1, 11, size=N)
+    p1 = np.random.randint(image_props['D_min'], image_props['D_max']+1, size=N)
     alpha = np.random.uniform(0.1, 1, size=N)
     p2 = alpha*p1
-    theta = np.random.uniform(0, np.pi, size=N)
-
+    theta = np.random.uniform(0, image_props['angle_max'], size=N)
+    
     if fov is None:
         fov = np.array([128,128])
         
     # Create trajectories
     pos = create_trajectories(p1, p2, theta, fov, N, T, dt)
-    
+
     # Get labels
     labels = np.stack((p1,p2,theta), axis=-1) # shape: (N,3)
 
@@ -153,7 +148,7 @@ def gaussian_2d(xc, yc, sigma, grid_size, amplitude):
     gauss = amplitude * np.exp(-(((x - xc) ** 2) / (2 * sigma ** 2) + ((y - yc) ** 2) / (2 * sigma ** 2)))
     return gauss
 
-def get_props(T: int, image_props: dict) -> tuple:
+def get_props(image_props: dict) -> tuple:
     """
     Fetch image props from dictionary
     """
@@ -173,13 +168,14 @@ def get_props(T: int, image_props: dict) -> tuple:
     
     gaussian_sigma = upsampling_factor/ resolution * fwhm_psf/2.355
     poisson_noise = image_props["poisson_noise"]
+    gaussian_noise = image_props["gaussian_noise"]
     
     particle_mean, particle_std = image_props["particle_intensity"][0],image_props["particle_intensity"][1]
     background_mean, background_std = image_props["background_intensity"][0],image_props["background_intensity"][1]
     nPosPerFrame = image_props['n_pos_per_frame']
 
     return (nFrames, traj_unit, resolution, output_size, gaussian_sigma, poisson_noise, 
-        particle_mean, particle_std, background_mean, background_std, nPosPerFrame, upsampling_factor) 
+        particle_mean, particle_std, background_mean, background_std, nPosPerFrame, upsampling_factor, gaussian_noise) 
 
 def trajectories_to_videos(pos: np.ndarray, image_props: dict) -> np.ndarray:
     """
@@ -198,14 +194,14 @@ def trajectories_to_videos(pos: np.ndarray, image_props: dict) -> np.ndarray:
     Andi simulation code 128x128 px^2 fov, dt=0.1s, D in px^2/frame, resolution of 100nm per pixel, D on the order of 0.01 um^2/s -> pixel size and framerate tell us D=0.1 px^2/ dt
     """
     # Get trajectory dimensions
-    N, T, _ = pos.shape
+    N, _, _ = pos.shape
     
     # Invert the y axis, for video creation purposes where y-axis is inverted
     pos[:, :, 1] *= -1
 
     # Get imaging properties
     (nFrames, traj_unit, resolution, output_size, gaussian_sigma, poisson_noise, 
-        particle_mean, particle_std, background_mean, background_std, nPosPerFrame, upsampling_factor) = get_props(T, image_props)
+        particle_mean, particle_std, background_mean, background_std, nPosPerFrame, upsampling_factor, gaussian_noise) = get_props(image_props)
     
     if(traj_unit !=-1 ):
         # put the trajectory in pixels
@@ -214,8 +210,8 @@ def trajectories_to_videos(pos: np.ndarray, image_props: dict) -> np.ndarray:
     out_videos = np.zeros((N,nFrames,output_size,output_size),np.float32)
 
     for n in range(N):
-        generate_video(out_videos[n,:],pos[n,:],nFrames,output_size,upsampling_factor,nPosPerFrame,
-                                            gaussian_sigma,particle_mean,particle_std,background_mean,background_std, poisson_noise)
+        generate_video_vectorized(out_videos[n,:],pos[n,:],nFrames,output_size,upsampling_factor,nPosPerFrame,
+                                            gaussian_sigma,particle_mean,particle_std,background_mean,background_std, poisson_noise, gaussian_noise)
     
     videos = normalize_images(out_videos, background_mean, background_std, particle_mean + background_mean)
     
@@ -239,14 +235,14 @@ def trajectories_to_videos_and_centroids(pos: np.ndarray, image_props: dict) -> 
     Andi simulation code 128x128 px^2 fov, dt=0.1s, D in px^2/frame, resolution of 100nm per pixel, D on the order of 0.01 um^2/s -> pixel size and framerate tell us D=0.1 px^2/ dt
     """
     # Get trajectory dimensions
-    N, T, _ = pos.shape
+    N, _, _ = pos.shape
     
     # Invert the y axis, for video creation purposes where y-axis is inverted
     pos[:, :, 1] *= -1
 
     # Get imaging properties
     (nFrames, traj_unit, resolution, output_size, gaussian_sigma, poisson_noise, 
-        particle_mean, particle_std, background_mean, background_std, nPosPerFrame, upsampling_factor) = get_props(T, image_props)
+        particle_mean, particle_std, background_mean, background_std, nPosPerFrame, upsampling_factor, gaussian_noise) = get_props(image_props)
 
     if(traj_unit !=-1 ):
         # put the trajectory in pixels
@@ -257,14 +253,14 @@ def trajectories_to_videos_and_centroids(pos: np.ndarray, image_props: dict) -> 
 
     for n in range(N):
         generate_video(out_videos[n,:],pos[n,:],nFrames,output_size,upsampling_factor,nPosPerFrame,
-                                            gaussian_sigma,particle_mean,particle_std,background_mean,background_std, poisson_noise,centroids[n,:])
+                                            gaussian_sigma,particle_mean,particle_std,background_mean,background_std, poisson_noise, gaussian_noise, centroids[n,:])
     
     videos = normalize_images(out_videos, background_mean, background_std, particle_mean + background_mean)
     
     return videos, centroids
 
 def generate_video(out_video: np.ndarray, trajectory: np.ndarray, nFrames: int, output_size: int, upsampling_factor: int, nPosPerFrame: int, 
-                   gaussian_sigma: float, particle_mean: float, particle_std: float, background_mean: float, background_std: float, poisson_noise: float, centroid: np.ndarray | None=None):
+                   gaussian_sigma: float, particle_mean: float, particle_std: float, background_mean: float, background_std: float, poisson_noise: int, gaussian_noise: bool, centroid: np.ndarray | None=None):
     """Helper function of function above, all arguments documented above"""
     for f in range(nFrames):
         frame_hr = np.zeros(( output_size*upsampling_factor, output_size*upsampling_factor),np.float32)
@@ -278,13 +274,13 @@ def generate_video(out_video: np.ndarray, trajectory: np.ndarray, nFrames: int, 
         xtraj = trajectory_segment[:,0]  * upsampling_factor
         ytraj = trajectory_segment[:,1] * upsampling_factor
 
-        frame_intensity = np.random.normal(particle_mean, particle_std)
 
         # Generate frame, convolution, resampling, noise
+        frame_intensity = np.random.normal(particle_mean, particle_std)
+        spot_intensity = frame_intensity / nPosPerFrame
         for p in range(nPosPerFrame):
             if(particle_mean >0.0001 and particle_std > 0.0001):
                 #spot_intensity = np.random.normal(particle_mean/nPosPerFrame,particle_std/nPosPerFrame)
-                spot_intensity = frame_intensity / nPosPerFrame
                 frame_spot = gaussian_2d(xtraj[p], ytraj[p], gaussian_sigma, output_size*upsampling_factor, spot_intensity)
 
                 # gaussian_2d maximum is not always the wanted one because of some misplaced pixels. 
@@ -296,17 +292,80 @@ def generate_video(out_video: np.ndarray, trajectory: np.ndarray, nFrames: int, 
         
         frame_lr = block_reduce(frame_hr, block_size=upsampling_factor, func=np.mean)
         # Add Gaussian noise to background intensity across the image
-        frame_lr += np.clip(np.random.normal(background_mean, background_std, frame_lr.shape), 
-                                    0, background_mean + 3 * background_std)
+        if gaussian_noise:
+            frame_lr += np.clip(np.random.normal(background_mean, background_std, frame_lr.shape), 
+                                        0, background_mean + 3 * background_std)
         
         # Add poisson noise if specified
         if poisson_noise != -1:
             frame_lr = frame_lr * np.random.poisson(poisson_noise, size=(frame_lr.shape)) / poisson_noise
 
         out_video[f,:] = frame_lr
-        # Case where we want features for relative motion between frames
+        
+        # Case where we want features for relative displacement between frames
         if centroid is not None:    
             centroid[f,:] = get_image_centroid(frame_lr, output_size) + mean
+
+def generate_video_vectorized(out_video: np.ndarray, trajectory: np.ndarray, nFrames: int, output_size: int, upsampling_factor: int, nPosPerFrame: int, 
+                   gaussian_sigma: float, particle_mean: float, particle_std: float, background_mean: float, background_std: float, poisson_noise: int, gaussian_noise: bool, centroid: np.ndarray | None=None):
+    """
+    Vectorized version of the above function
+    """
+    grid_size = output_size * upsampling_factor
+
+    # Precompute coordinate grid for Gaussian generation
+    limit = (grid_size - 1) // 2  # Defines the range for x and y axes
+    x = np.linspace(-limit, limit, grid_size)
+    y = np.linspace(-limit, limit, grid_size)
+    xx, yy = np.meshgrid(x, y)
+
+    # Center trajectory segements
+    trajectory = trajectory.reshape(nFrames, nPosPerFrame, 2)
+    means = trajectory.mean(axis=1, keepdims=True) # (nFrames, 1, 2)
+    traj_centered = (trajectory - means) * upsampling_factor
+    xc = traj_centered[..., 0]
+    yc = traj_centered[..., 1]
+
+    # Generate random variables
+    frame_intensity = np.random.normal(particle_mean, particle_std, size=(nFrames,1,1))
+    spot_intensity = frame_intensity / nPosPerFrame
+
+    # Vectorized Gaussian computation for all particles
+    x_diff = xx[None, None, :, :] - xc[:, :, None, None]
+    y_diff = yy[None, None, :, :] - yc[:, :, None, None]
+    gaussians = np.exp(-(x_diff**2 + y_diff**2) / (2 * gaussian_sigma**2)) # (nFrames, nPosPerFrame, grid_size, grid_size)
+
+    # Normalize each Gaussian to its own max, then scale
+    gaussians /= np.max(gaussians, axis=(2, 3), keepdims=True)
+    frame_hr = spot_intensity * np.sum(gaussians, axis=1)
+
+    # Downsample (block average)
+    frame_lr = np.stack([
+            block_reduce(frame_hr[f], block_size=upsampling_factor, func=np.mean)
+            for f in range(nFrames)
+        ]) # shape (nFrames, output_size, output_size)
+
+    # Background Gaussian noise
+    if gaussian_noise:
+        noise = np.random.normal(background_mean, background_std, size=frame_lr.shape)
+        noise = np.clip(noise, 0, background_mean + 3 * background_std)
+        frame_lr += noise
+
+    # Optional Poisson noise
+    if poisson_noise != -1:
+        poisson = np.random.poisson(poisson_noise, size=frame_lr.shape) / poisson_noise
+        frame_lr *= poisson
+
+    # Case where we want features for relative displacement between frames
+    if centroid is not None:
+        limit = (output_size - 1) // 2
+        x = np.linspace(-limit, limit, output_size)
+        coords = np.stack(np.meshgrid(x,x), axis=-1) # (output_size, output_size, 2)
+        total_intensity = np.sum(frame_lr, axis=(1,2))[:, None]
+        centroid[...] = np.sum(coords * frame_lr[..., None], axis=(1,2)) / total_intensity
+        centroid[...] += means.squeeze(1)
+
+    out_video[...] = frame_lr
 
 def get_image_centroid(image: np.ndarray, grid_size: int) -> np.ndarray:
     """
