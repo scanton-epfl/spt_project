@@ -1,14 +1,11 @@
-from os import sysconf
 from types import LambdaType
 import torch
 import torch.nn as nn
 from torch.utils.data import Dataset, DataLoader
-import torch.optim as optim
-import numpy as np
 import torch.nn.functional as F
 import math
 
-MAX_TOKENS = 128
+MAX_TOKENS = 512
 
 # -----------------------------------------------------------------------------------------
 # Dataset objects for PyTorch implementations
@@ -65,7 +62,7 @@ class MultiheadAttention(nn.Module):
     """
     Object for representing multi-head attention
     """
-    def __init__(self, embed_dim: int, num_heads: int, dropout: float=0.0):
+    def __init__(self, embed_dim: int, num_heads: int, dropout: float=0.0, use_rotary=True):
         super().__init__()
         self.embed_dim = embed_dim
         self.num_heads = num_heads
@@ -80,6 +77,11 @@ class MultiheadAttention(nn.Module):
 
         self.dropout = nn.Dropout(dropout)
 
+        # Rotary embeddings
+        self.use_rotary = use_rotary
+        if use_rotary:
+            self.rope = Rotary(self.head_dim)
+
     def forward(self, x: torch.Tensor):
         """
         Forward pass through self-attention mechanism
@@ -91,17 +93,13 @@ class MultiheadAttention(nn.Module):
         k = self.k_proj(x).view(batch_size, -1, self.num_heads, self.head_dim).transpose(1,2)
         v = self.v_proj(x).view(batch_size, -1, self.num_heads, self.head_dim).transpose(1,2)
 
+        # Apply RoPE embeddings if requested
+        if self.use_rotary:
+            cos, sin = self.rope(q)
+            q, k = apply_rotary_pos_emb(q, k, cos, sin)
+
         # Replace below with torch implementation
-        # context = F.scaled_dot_product_attention(q, k, v, dropout_p=self.dropout.p, is_causal=False)
-
-        # Scaled dot-product attention
-        scores = torch.matmul(q, k.transpose(-2,-1)) / math.sqrt(self.head_dim)
-
-        attn_weights = F.softmax(scores, dim=-1)
-        attn_weights = self.dropout(attn_weights)
-
-        # Apply attention weights to values
-        context = torch.matmul(attn_weights, v)
+        context = F.scaled_dot_product_attention(q, k, v, dropout_p=self.dropout.p, is_causal=False)
 
         # Concat heads together
         context = context.transpose(1,2).contiguous().view(batch_size, -1, self.embed_dim)
@@ -115,7 +113,7 @@ class CrossAttention(nn.Module):
     """
     Object for representing cross attention
     """
-    def __init__(self, embed_dim: int, num_heads: int, dropout: float=0.0):
+    def __init__(self, embed_dim: int, num_heads: int, dropout: float=0.0, use_rotary=True):
         super().__init__()
         self.embed_dim = embed_dim
         self.num_heads = num_heads
@@ -135,6 +133,11 @@ class CrossAttention(nn.Module):
 
         self.dropout = dropout
 
+        # Rotary embeddings
+        self.use_rotary = use_rotary
+        if use_rotary:
+            self.rope = Rotary(self.head_dim)
+
     def forward(self, tokens_a: torch.Tensor, tokens_b: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
         """
         Forward pass through cross attention module
@@ -149,6 +152,12 @@ class CrossAttention(nn.Module):
         k_b = self.k_proj_b(tokens_b).view(batch_size, -1, self.num_heads, self.head_dim).transpose(1,2)
         v_b = self.v_proj_b(tokens_b).view(batch_size, -1, self.num_heads, self.head_dim).transpose(1,2)
 
+        # Apply RoPE embeddings if requested
+        if self.use_rotary:
+            cos, sin = self.rope(q_a) # can use this for both since sequence lengths are equal
+            q_a, k_a = apply_rotary_pos_emb(q_a, k_a, cos, sin)
+            q_b, k_b = apply_rotary_pos_emb(q_b, k_b, cos, sin)
+
         # Get heads from each attention mechanism
         context_a = F.scaled_dot_product_attention(q_b, k_a, v_a, dropout_p=self.dropout) # (batch_size, num_heads, seq_len, head_dim)
         context_b = F.scaled_dot_product_attention(q_a, k_b, v_b, dropout_p=self.dropout)
@@ -162,7 +171,7 @@ class CrossAttention(nn.Module):
         output_b = self.out_proj_b(context_b)
 
         return output_a, output_b
-    
+
 # -----------------------------------------------------------------------------------------
 # Model building blocks
 
@@ -191,11 +200,11 @@ class TransformerBlock(nn.Module):
     """
     Object for representing a transformer block
     """
-    def __init__(self, embed_dim: int, num_heads: int, hidden_dim: int, dropout: float=0.0):
+    def __init__(self, embed_dim: int, num_heads: int, hidden_dim: int, dropout: float=0.0, use_rotary: bool=False):
         super().__init__()
         
         # Attention mechanism
-        self.self_attn = MultiheadAttention(embed_dim, num_heads, dropout)
+        self.self_attn = MultiheadAttention(embed_dim, num_heads, dropout, use_rotary)
 
         # Normalization layers
         self.norm1 = nn.LayerNorm(embed_dim)
@@ -231,11 +240,11 @@ class CrossTransformerBlock(nn.Module):
     """
     Object representing a transformer block in a cross attention based model
     """
-    def __init__(self, embed_dim: int, num_heads: int, hidden_dim: int, dropout: float=0.0):
+    def __init__(self, embed_dim: int, num_heads: int, hidden_dim: int, dropout: float=0.0, use_rotary: bool=False):
         super().__init__()
         
         # Attention mechanism
-        self.cross_attn = CrossAttention(embed_dim, num_heads, dropout)
+        self.cross_attn = CrossAttention(embed_dim, num_heads, dropout, use_rotary)
 
         # Normalization layers
         self.norm1_a = nn.LayerNorm(embed_dim)
@@ -279,18 +288,22 @@ class Transformer(nn.Module):
     """
     Object for representing a transformer encoder
     """
-    def __init__(self, embed_dim: int, num_heads: int, hidden_dim: int, num_layers: int, dropout: float, use_pos_encoding: bool=False):
+    def __init__(self, embed_dim: int, num_heads: int, hidden_dim: int, num_layers: int, dropout: float, use_pos_encoding: bool=False, use_rotary: bool=False):
         super().__init__()
         self.embed_dim = embed_dim
-        self.use_pos_encoding = use_pos_encoding
+        if use_pos_encoding and use_rotary:
+            print('Only apply Sinusoidal or RoPE embeddings, not both!')
+            use_pos_encoding = False
+        self.use_pos_embed = use_pos_encoding
 
-        # Learning positional encoding (optional)
-        if self.use_pos_encoding:
-            self.pos_embedding = nn.Parameter(torch.randn(1, MAX_TOKENS, embed_dim))
+        # Positional embeddings
+        if self.use_pos_embed:
+            #self.pos_embedding = nn.Parameter(torch.rand(1, MAX_TOKENS, embed_dim))
+            self.add_pos_embed = SinusoidalPositionEmbedding(embed_dim)
         
         # Transformer blocks
         self.encoder_layers = nn.ModuleList([
-            TransformerBlock(embed_dim, num_heads, hidden_dim, dropout)
+            TransformerBlock(embed_dim, num_heads, hidden_dim, dropout, use_rotary)
             for _ in range(num_layers)
         ])
 
@@ -301,8 +314,8 @@ class Transformer(nn.Module):
         """
         Pass through complete transformer encoder
         """
-        if self.use_pos_encoding:
-            x = x + self.pos_embedding[:, x.shape[1], :]
+        if self.use_pos_embed:
+            x = self.add_pos_embed(x)
 
         for layer in self.encoder_layers:
             x = layer(x)
@@ -313,13 +326,27 @@ class CrossTransformer(nn.Module):
     """
     Object representing a cross attention based transformer
     """
-    def __init__(self, embed_dim: int, num_heads: int, hidden_dim: int, num_layers: int, dropout: float):
+    def __init__(self, embed_dim: int, num_heads: int, hidden_dim: int, num_layers: int, dropout: float, use_pos_encoding: bool=False, use_segment_embed: bool=False, use_rotary: bool=False):
         super().__init__()
         self.embed_dim = embed_dim
-        
+        if use_pos_encoding and use_rotary:
+            print('Only apply Sinusoidal or RoPE embeddings, not both!')
+            use_pos_encoding = False
+        self.use_pos_embed = use_pos_encoding
+        self.use_seg_embed = use_segment_embed
+
+        # Positional embeddings
+        if self.use_pos_embed:
+            #self.pos_embedding = nn.Parameter(torch.rand(1, MAX_TOKENS, embed_dim))
+            self.add_pos_embed = SinusoidalPositionEmbedding(embed_dim)
+            
+        # Segment embeddings: 0 = tokens_a, 1 = tokens_b
+        if self.use_seg_embed:
+            self.segment_embedding = nn.Embedding(2,embed_dim)
+
         # Transformer blocks
         self.encoder_layers = nn.ModuleList([
-            CrossTransformerBlock(embed_dim, num_heads, hidden_dim, dropout)
+            CrossTransformerBlock(embed_dim, num_heads, hidden_dim, dropout, use_rotary)
             for _ in range(num_layers)
         ])
 
@@ -327,15 +354,33 @@ class CrossTransformer(nn.Module):
         self.norm_a = nn.LayerNorm(embed_dim)
         self.norm_b = nn.LayerNorm(embed_dim)
     
+    def get_embeddings(self, x: torch.Tensor, segment_id: int=0):
+        """
+        Apply positional and segment embeddings
+        """
+        batch_size, seq_len, _ = x.shape
+
+        if self.use_pos_embed:
+            x = self.add_pos_embed(x)
+
+        if self.use_seg_embed:
+            seg_ids = torch.full((batch_size, seq_len), segment_id, dtype=torch.long, device=x.device)
+            x = x + self.segment_embedding(seg_ids)
+
+        return x
+
     def forward(self, tokens_a: torch.Tensor, tokens_b: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
         """
         Forward pass through cross attention transformer
         """
+        tokens_a = self.get_embeddings(tokens_a, segment_id=0)
+        tokens_b = self.get_embeddings(tokens_b, segment_id=1)
+
         for layer in self.encoder_layers:   
             tokens_a, tokens_b = layer(tokens_a, tokens_b)
         
         return self.norm_a(tokens_a), self.norm_b(tokens_b)
-    
+
 class RegressionHead(nn.Module):
     """
     Object representing the MLP head for prediction of the diffusion parameters
@@ -515,7 +560,7 @@ class DiffusionTensorRegModel(DiffusionTensorRegModelBase):
     Object representing the model for predicting the diffusion tensor w/ displacement data as a second mode
     """
     def __init__(self, embed_dim: int, num_heads: int, hidden_dim: int, num_layers: int, 
-                 dropout: float, use_pos_encoding: bool=False, use_sum: bool=False):
+                 dropout: float, use_pos_encoding: bool=False, use_sum: bool=False, use_rotary: bool=False):
         super().__init__(embed_dim, num_heads, hidden_dim, num_layers, dropout, use_pos_encoding)
         
         # Method for combining
@@ -528,7 +573,7 @@ class DiffusionTensorRegModel(DiffusionTensorRegModelBase):
         self.cls = nn.Parameter(torch.randn(1,1,embed_dim))
 
         # Instantiate transformer encoder
-        self.transformer = Transformer(embed_dim, num_heads, hidden_dim, num_layers, dropout, use_pos_encoding)
+        self.transformer = Transformer(embed_dim, num_heads, hidden_dim, num_layers, dropout, use_pos_encoding, use_rotary)
 
         # Instantiate regression head
         self.mlp = RegressionHead(embed_dim, hidden_dim, dropout=dropout)
@@ -684,7 +729,7 @@ class CrossAttentionModelBase(nn.Module):
     """
     Object representing a model based on cross attention between two modalities
     """
-    def __init__(self, embed_dim: int, num_heads: int, hidden_dim: int, num_layers: int, dropout: float, output_dim: int=4):
+    def __init__(self, embed_dim: int, num_heads: int, hidden_dim: int, num_layers: int, dropout: float, output_dim: int=4, use_pos_embed: bool=False, use_segment_embed: bool=False, use_rotary: bool=False):
         super().__init__()
         # Instantiate embedding model
         self.image_encoder = DeepResNetEmbedding(embed_dim)
@@ -696,7 +741,7 @@ class CrossAttentionModelBase(nn.Module):
         self.cls2 = nn.Parameter(torch.randn(1,1,embed_dim))
 
         # Instantiate transformer encoder
-        self.transformer = CrossTransformer(embed_dim, num_heads, hidden_dim, num_layers, dropout)
+        self.transformer = CrossTransformer(embed_dim, num_heads, hidden_dim, num_layers, dropout, use_pos_embed, use_segment_embed, use_rotary)
 
         # Instantiate regression head
         self.mlp = RegressionHead(embed_dim, hidden_dim, dropout=dropout, output_dim=output_dim)
@@ -745,11 +790,11 @@ class CrossAttentionModel(CrossAttentionModelBase):
     """
     Object representing a model that uses cross attention and self attention across two layers
     """
-    def __init__(self, embed_dim: int, num_heads: int, hidden_dim: int, num_layers: int, dropout: float, output_dim: int=4):
-        super().__init__(embed_dim, num_heads, hidden_dim, num_layers, dropout, output_dim)
+    def __init__(self, embed_dim: int, num_heads: int, hidden_dim: int, num_layers: int, dropout: float, output_dim: int=4, use_pos_embed: bool=False, use_segment_embed: bool=False, use_rotary: bool=False):
+        super().__init__(embed_dim, num_heads, hidden_dim, num_layers, dropout, output_dim, use_pos_embed, use_segment_embed, use_rotary)
 
         # Instantiate transformer to handle output of CrossTransformer
-        self.t2 = Transformer(embed_dim, num_heads, hidden_dim, num_layers, dropout)
+        self.t2 = Transformer(embed_dim, num_heads, hidden_dim, num_layers, dropout, use_rotary=use_rotary)
     
     def forward(self, x: torch.Tensor, disp: torch.Tensor) -> torch.Tensor:
         """
@@ -771,7 +816,151 @@ class CrossAttentionModel(CrossAttentionModelBase):
         predictions = self.mlp(output[:,0,:])
 
         return predictions
+
+class MultiStateModel(nn.Module):
+    """
+    Object representing a cross transformer based model for multi-state diffusion prediction
+    """
+    def __init__(self, embed_dim: int, num_heads: int, hidden_dim: int, num_layers: int, dropout: float, output_dim: int=4, use_pos_embed: bool=False, use_segment_embed: bool=False, use_rotary: bool=False):
+        super().__init__()
+        # Instantiate embedding model
+        self.image_encoder = DeepResNetEmbedding(embed_dim)
+        self.norm = nn.LayerNorm(embed_dim)
+        self.disp_encoder = MLP(input_dim=2, hidden_dim=hidden_dim, num_layers=2, output_dim=embed_dim)
+
+        # Instantiate cross transformer encoder
+        self.cross_transformer = CrossTransformer(embed_dim, num_heads, hidden_dim, num_layers, dropout, use_pos_embed, use_segment_embed, use_rotary)
+        
+        # Instantiate transformer to handle output of cross transformer
+        self.transformer = Transformer(embed_dim, num_heads, hidden_dim, num_layers, dropout, use_rotary=use_rotary)
+
+        # Instantiate regression head
+        self.mlp = RegressionHead(embed_dim*2, hidden_dim, dropout=dropout, output_dim=output_dim)
+
+    def forward(self, tokens_a: torch.Tensor, tokens_b: torch.Tensor) -> torch.Tensor:
+        """
+        Forward pass through model
+        """
+        # Encode images and displacements
+        encoded_images = self.image_encoder(tokens_a)
+        encoded_images = self.norm(encoded_images)
+        encoded_disp = self.disp_encoder(tokens_b)
+
+        # Pass context to transformer
+        image_out, disp_out = self.cross_transformer(encoded_images, encoded_disp)
+
+        # Combine outputs to get input to final transformer
+        tokens = torch.cat((image_out, disp_out), dim=1)
+
+        # Pass through final transformer
+        output = self.transformer(tokens)
+
+        # Get prediction per token
+        _, seq_len, _ = image_out.shape
+        image_out = output[:, :seq_len, :]
+        disp_out = output[:, seq_len:, :]
+        mlp_input = torch.cat((image_out, disp_out), dim=-1)
+
+        predictions = self.mlp(mlp_input)
+
+        return predictions
+
+# -----------------------------------------------------------------------------------------
+# Baseline Models
+
+class LSTM(nn.Module):
+    """
+    Object representing a LSTM model for comparison to transformer implementation
+    """
+    def __init__(self, embed_dim: int, hidden_dim: int, num_layers: int, output_dim: int=4, bidirectional: bool=False, dropout: float=0):
+        super().__init__()
+        self.image_encoder = DeepResNetEmbedding(embed_dim)
+        self.norm = nn.LayerNorm(embed_dim)
+        self.lstm = nn.LSTM(embed_dim, hidden_dim, num_layers, batch_first=True, bidirectional=bidirectional, dropout=dropout)
+        self.fc = RegressionHead(hidden_dim, hidden_dim, dropout, output_dim)
+
+    def forward(self, x):
+        """
+        Forward pass through LSTM-based model
+        """
+        # Extract CNN features for each frame
+        frame_features = self.image_encoder(x)
+        frame_features = self.norm(frame_features)
+
+        # Process temporal sequence
+        lstm_out, _ = self.lstm(frame_features)
+        if self.lstm.bidirectional:
+            forward_last = lstm_out[:, -1, :self.lstm.hidden_size]   # forward final timestep
+            backward_last = lstm_out[:, 0, self.lstm.hidden_size:]   # backward first timestep
+            last_hidden = torch.cat([forward_last, backward_last], dim=-1)  # shape (B, 2*hidden_size)
+        else:
+            last_hidden = lstm_out[:, -1, :]
+
+        # Regression output
+        out = self.fc(last_hidden)
+
+        return out
+
+class Pix2D(nn.Module):
+    """
+    Object representing the model used in the Pix2D paper https://github.com/ha-park/Pix2D-NN-diffusivity-mapping
+    """
+    def __init__(self, n_channel=16, output_dim=4):
+        super().__init__()
+
+        self.model = nn.Sequential(
+            # First conv block
+            nn.Conv2d(1, n_channel*2, kernel_size=3, padding=1),  # 'same' padding
+            nn.BatchNorm2d(n_channel*2),
+            nn.SiLU(),
+            
+            # Second conv block with stride=2 (downsampling)
+            nn.Conv2d(n_channel*2, n_channel*2, kernel_size=2, stride=2),
+            nn.BatchNorm2d(n_channel*2),
+            nn.SiLU(),
+            
+            # Third conv block
+            nn.Conv2d(n_channel*2, n_channel*4, kernel_size=3, padding=1),
+            nn.BatchNorm2d(n_channel*4),
+            nn.SiLU(),
+            
+            # Fourth conv block with stride=2
+            nn.Conv2d(n_channel*4, n_channel*4, kernel_size=2, stride=2),
+            nn.BatchNorm2d(n_channel*4),
+            nn.SiLU(),
+            
+            # Fifth conv block
+            nn.Conv2d(n_channel*4, n_channel*8, kernel_size=3, padding=1),
+            nn.BatchNorm2d(n_channel*8),
+            nn.SiLU(),
+            
+            # Sixth conv block
+            nn.Conv2d(n_channel*8, n_channel*8, kernel_size=3, padding=1),
+            nn.BatchNorm2d(n_channel*8),
+            nn.SiLU(),
+            
+            # Dropout
+            nn.Dropout(0.2),
+            
+            # Global Average Pooling to flatten
+            nn.AdaptiveAvgPool2d((1,1)),
+            nn.Flatten()
+        )
+
+        # Fully connected regression layer
+        self.fc = nn.Linear(n_channel*8, output_dim)
     
+    def forward(self, x):
+        batch_size, num_images, h, w = x.shape
+        x = x.reshape(batch_size * num_images, 1, h, w)  # Flatten num_images into batch
+
+        x = self.model(x)
+
+        x = x.view(batch_size, num_images, -1)
+        x = x.mean(dim=1)
+
+        return self.fc(x)
+
 # -----------------------------------------------------------------------------------------
 # Loss function helpers
 
@@ -863,41 +1052,110 @@ def mse_loss(labels: torch.Tensor, predictions: torch.Tensor) -> torch.Tensor:
     """
     MSE loss function
     Args:
-        labels: torch.Tensor (batch_size, 3)
-        predictions: torch.Tensor (batch_size, 4)
+        labels: torch.Tensor (batch_size, 3) or (batch_size, nFrames, 3)
+        predictions: torch.Tensor (batch_size, 4) or (batch_size, nFrames, 4)
 
     Returns:
         loss: torch.Tensor (1,)
             Loss computed via the MSE metric
     """
     # Decompose to each parameter
-    p1_pred, p2_pred, sin_2theta_pred, cos_2theta_pred = predictions[:,0], predictions[:,1], predictions[:,2], predictions[:,3]
+    p1_pred = predictions[..., 0]
+    p2_pred = predictions[..., 1]
+    sin_2theta_pred = predictions[..., 2]
+    cos_2theta_pred = predictions[..., 3]
 
-    # # Normalize predicted sin/cos to unit circle
+    # Normalize predicted sin/cos to unit circle
     norm = torch.sqrt(sin_2theta_pred**2 + cos_2theta_pred**2 + 1e-8)
     sin_2theta_pred = sin_2theta_pred / norm
     cos_2theta_pred = cos_2theta_pred / norm
     
     # Compute true values
-    theta = labels[:,-1]
+    theta = labels[..., -1]
     sin_2theta_true = torch.sin(2 * theta)
     cos_2theta_true = torch.cos(2 * theta)
 
-    # MSE on linear and angular parts
-    mse_linear = ((p1_pred - labels[:,0])**2 + (p2_pred - labels[:,1])**2).mean()
-    mse_angle = ((sin_2theta_pred - sin_2theta_true)**2 + (cos_2theta_pred - cos_2theta_true)**2).mean()
+    # MSE on diffusion and angular parts
+    mse_diffusion = (p1_pred - labels[..., 0])**2 + (p2_pred - labels[..., 1])**2
+    mse_angle = (sin_2theta_pred - sin_2theta_true)**2 + (cos_2theta_pred - cos_2theta_true)**2
 
-    return mse_linear + mse_angle
+    return (mse_diffusion + mse_angle).mean()
 
 def mse_loss_coeff(labels: torch.Tensor, predictions: torch.Tensor) -> torch.Tensor:
     """
     MSE loss function for purely diffusion coefficient predictions
     Args:
-        labels: torch.Tensor (batch_size, 3)
-        predictions: torch.Tensor (batch_size, 2)
-
+        labels: torch.Tensor (batch_size, 3) or (batch_size, nFrames, 3)
+        predictions: torch.Tensor (batch_size, 4) or (batch_size, nFrames, 4)
     Returns:
         loss: torch.Tensor (1,)
             Loss computed via the MSE metric
     """
-    return torch.mean((predictions - labels[:,:-1])**2)
+    return torch.mean((predictions - labels[..., :-1])**2)
+
+# -----------------------------------------------------------------------------------------
+# Positional embeddings helpers
+
+class SinusoidalPositionEmbedding(nn.Module):
+    def __init__(self, embed_dim, max_len=MAX_TOKENS):
+        super().__init__()
+        # Create a (max_len, embed_dim) matrix
+        position = torch.arange(0, max_len, dtype=torch.float).unsqueeze(1)  # [max_len, 1]
+        div_term = torch.exp(torch.arange(0, embed_dim, 2).float() * (-math.log(10000.0) / embed_dim))
+
+        pe = torch.zeros(max_len, embed_dim)
+        pe[:, 0::2] = torch.sin(position * div_term)  # even indices
+        pe[:, 1::2] = torch.cos(position * div_term)  # odd indices
+        pe = pe.unsqueeze(0)  # shape [1, max_len, embed_dim] for broadcasting
+
+        self.register_buffer('pe', pe)
+
+    def forward(self, x):
+        """
+        Args:
+            x: Tensor of shape [batch_size, seq_len, embed_dim]
+        Returns:
+            Tensor of shape [batch_size, seq_len, embed_dim]
+        """
+        seq_len = x.size(1)
+        return x + self.pe[:, :seq_len]
+
+class Rotary(torch.nn.Module):
+    """
+    Object for representing a cached rotary matrix for computing RoPE embeddings
+    """
+    def __init__(self, dim, base=10000):
+        super().__init__()
+        inv_freq = 1.0 / (base ** (torch.arange(0, dim, 2).float() / dim))
+        self.register_buffer("inv_freq", inv_freq)
+        self.seq_len_cached = None
+        self.cos_cached = None
+        self.sin_cached = None
+
+    def forward(self, x, seq_dim=2):
+        seq_len = x.shape[seq_dim]
+        if seq_len != self.seq_len_cached:
+            self.seq_len_cached = seq_len
+            t = torch.arange(x.shape[seq_dim], device=x.device).type_as(self.inv_freq)
+            freqs = torch.einsum("i,j->ij", t, self.inv_freq) # shape: [seq_len, dim/2]
+            emb = torch.cat((freqs, freqs), dim=-1).to(x.device)
+            self.cos_cached = emb.cos()[None, None, :, :] # shape: [1, 1, seq_len, dim]
+            self.sin_cached = emb.sin()[None, None, :, :]
+
+        return self.cos_cached, self.sin_cached
+
+def rotate_half(x):
+    """
+    Rotates half the hidden dims of the input
+    """
+    x1 = x[..., : x.shape[-1] // 2]
+    x2 = x[..., x.shape[-1] // 2 :]
+    return torch.cat((-x2, x1), dim=-1)  
+
+def apply_rotary_pos_emb(q, k, cos, sin):
+    """
+    Apply RoPE embedding
+    """
+    q_embed = (q * cos) + (rotate_half(q) * sin)
+    k_embed = (k * cos) + (rotate_half(k) * sin)
+    return q_embed, k_embed

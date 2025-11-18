@@ -1,6 +1,137 @@
 import numpy as np
 from skimage.measure import block_reduce
 
+def generate_diffusion_props(N, D_min, D_max, angle_max, is_isotropic=False):
+    # Generate random diffusion parameters
+    p1 = np.random.randint(D_min, D_max+1, size=N)
+    if not is_isotropic:
+        alpha = np.random.uniform(0.1, 1, size=N)
+        p2 = alpha*p1
+        theta = np.random.uniform(0, angle_max, size=N)
+    else:
+        p2 = p1
+        theta = np.zeros(N)
+
+    return p1, p2, theta
+
+def create_multi_state_displacements(p1: np.ndarray, p2: np.ndarray, theta: np.ndarray, N: int, T: int, dt: int):
+    """
+    Create displacements for all time steps
+
+    Args:
+        p1: np.ndarray (N,T)
+            Diffusion coefficient in first prinicipal component
+        p2: np.ndarray (N,T)
+            Diffusion coefficient in second prinicipal component
+        theta: np.ndarray (N,T)
+            Angle w/ respect to x-axis, corresponding to the orientation of the first prinicipal component
+        N: int
+            Number of trajectories to generate
+        T: int
+            Number of timesteps to simulate for each trajectory
+        dt: int/float
+            Timestep for simulation (now unitless and set to 1)
+    Returns:
+        disp: np.ndarray(N,T,2)
+            Displacements for each step in the simulations  
+    """
+    # Create array with diffusion principal values for each trajectory
+    D = np.stack((p1, p2), axis=-1) # shape: (N,T,2)
+
+    # Generate std deviations across principal axes
+    sig = np.sqrt(2.0 * dt * D) # shape: (N,T,2)
+
+    # Create rotation matrix
+    cos_t = np.cos(theta) # shape: (N,T)
+    sin_t = np.sin(theta)
+    R = np.stack([
+            np.stack([cos_t, -sin_t], axis=-1),
+            np.stack([sin_t, cos_t], axis=-1)
+        ], axis=-2) # shape: (N,T,2,2)
+
+    # Create step sizes in each direction generated from normal distribution
+    steps = np.random.normal(0.0, 1.0, size=(N,T,2))
+
+    # Create displacements
+    tmp = steps * sig # shape: (N,T,2)
+    disp = np.einsum('ntij,ntj->nti', R, tmp)
+
+    return disp
+
+def create_multi_state_trajectories(p1: np.ndarray, p2: np.ndarray, theta: np.ndarray, fov: np.ndarray, N: int, T: int, dt: int):
+    """
+    Create array of multi-state trajectories given diffusion parameters
+
+    Args:
+        p1: np.ndarray (N,T)
+            Diffusion coefficient in first prinicipal component
+        p2: np.ndarray (N,T)
+            Diffusion coefficient in second prinicipal component
+        theta: np.ndarray (N,T)
+            Angle w/ respect to x-axis, corresponding to the orientation of the first prinicipal component
+        fov: np.ndarray (2,)
+            Window size of imaging
+        N: int
+            Number of trajectories to generate
+        T: int
+            Number of timesteps to simulate for each trajectory
+        dt: int/float
+            Timestep for simulation (now unitless and set to 1)
+    Returns:
+        pos: np.ndarray (N,T,2)
+            Array containing the 2D trajectories
+    """
+    # Create displacements across all particles and time steps
+    disp = create_multi_state_displacements(p1, p2, theta, N, T, dt)
+
+    # Get position trajectories
+    pos_0 = np.random.uniform(fov[0]/4, 3*fov[0]/4, size=(N,2))
+    pos = np.cumsum(disp, axis=1) # shape: (N,T,2)
+    pos += pos_0[:, None, :] # shift all positions by starting point
+
+    return pos
+    
+def create_displacements(p1: np.ndarray, p2: np.ndarray, theta: np.ndarray, N: int, T: int, dt: int):
+    """
+    Create displacements for all time steps
+
+    Args:
+        p1: np.ndarray (N,)
+            Diffusion coefficient in first prinicipal component
+        p2: np.ndarray (N,)
+            Diffusion coefficient in second prinicipal component
+        theta: np.ndarray (N,)
+            Angle w/ respect to x-axis, corresponding to the orientation of the first prinicipal component
+        N: int
+            Number of trajectories to generate
+        T: int
+            Number of timesteps to simulate for each trajectory
+        dt: int/float
+            Timestep for simulation (now unitless and set to 1)
+    Returns:
+        disp: np.ndarray(N,T,2)
+            Displacements for each step in the simulations  
+    """
+    # Create array with diffusion principal values for each trajectory
+    D = np.stack((p1, p2), axis=-1) # shape: (N,2)
+
+    # Generate std deviations across principal axes
+    sig = np.sqrt(2.0 * dt * D) # shape: (N,2)
+
+    # Create rotation matrix
+    R = np.array([[np.cos(theta), -np.sin(theta)],
+                [np.sin(theta), np.cos(theta)]]) # shape: (2,2,N)
+    R = np.moveaxis(R, -1, 0)                      # -> (N,2,2)
+
+    # Create step sizes in each direction generated from normal distribution
+    steps = np.random.normal(0.0, 1.0, size=(N,T,2))
+
+    # Create displacements
+    tmp = steps * sig[:, None, :] # shape: (N,T,2)
+    disp = (R[:, None, :, :] @ tmp[..., None]).squeeze(-1) # shape: (N,T,2)
+
+    return disp
+
 def create_trajectories(p1: np.ndarray, p2: np.ndarray, theta: np.ndarray, fov: np.ndarray, N: int, T: int, dt: int):
     """
     Create array of trajectories given diffusion parameters
@@ -24,29 +155,13 @@ def create_trajectories(p1: np.ndarray, p2: np.ndarray, theta: np.ndarray, fov: 
         pos: np.ndarray (N,T,2)
             Array containing the 2D trajectories
     """
-
-    # Create array with diffusion principal values for each trajectory
-    D = np.stack((p1, p2), axis=-1) # shape: (N,2)
-
-    # Generate std deviations across principal axes
-    sig = np.sqrt(2.0 * dt * D) # shape: (N,2)
-
-    # Create rotation matrix
-    R = np.array([[np.cos(theta), -np.sin(theta)],
-                [np.sin(theta), np.cos(theta)]]) # shape: (2,2,N)
-    R = np.moveaxis(R, -1, 0)                      # -> (N,2,2)
-
-    # Create step sizes in each direction generated from normal distribution
-    steps = np.random.normal(0.0, 1.0, size=(N,T,2))
-
-    # Create displacements
-    tmp = steps * sig[:, None, :] # shape: (N,T,2)
-    disp = (R[:, None, :, :] @ tmp[..., None]).squeeze(-1) # shape: (N,T,2)
+    # Create displacements across all particles and time steps
+    disp = create_displacements(p1, p2, theta, N, T, dt)
 
     # Get position trajectories
     pos_0 = np.random.uniform(fov[0]/4, 3*fov[0]/4, size=(N,2))
-    disp[:,0,:] = pos_0 # Set time0 to 0 displacement
     pos = np.cumsum(disp, axis=1) # shape: (N,T,2)
+    pos += pos_0[:, None, :] # shift all positions by starting point
 
     return pos
     
@@ -55,20 +170,25 @@ def create_training_set(N: int, T: int, image_props: dict, dt: int=1, fov: np.nd
     Creates new training data containing video frames of trajectories and labels for a given cycle of training
 
     Args:
-        N (int): integer representing the number of trajectories to generate in a simulation
-        T (int): integer representing the number of timesteps for each simulation 
+        N: int
+            Number of trajectories to generate in a simulation
+        T: int
+            number of timesteps for each simulation
+        image_props: dict
+            Parameters needed for simulation
+        dt: int
+            Time step to be used for the simulation
+        fov: np.ndarray
+            Gives fov for viewing a simulation trajectory and used for random starting point in trajectory
          
     Returns:
         videos: np.ndarray 
                     Array of images for each trajectory
         labels: np.ndarray
-                    Array of labels for each trajectory generated
+                    Array of labels for each trajectory generated 
     """
     # Generate random diffusion parameters
-    p1 = np.random.randint(image_props['D_min'], image_props['D_max']+1, size=N)
-    alpha = np.random.uniform(0.1, 1, size=N)
-    p2 = alpha*p1
-    theta = np.random.uniform(0, image_props['angle_max'], size=N)
+    p1, p2, theta = generate_diffusion_props(N, image_props['D_min'], image_props['D_max'], image_props['angle_max'], is_isotropic=False)
 
     if fov is None:
         fov = np.array([128,128])
@@ -90,8 +210,16 @@ def create_training_set_w_features(N: int, T: int, image_props: dict, dt: int=1,
     Creates new training data containing video frames of trajectories and labels for a given cycle of training
 
     Args:
-        N (int): integer representing the number of trajectories to generate in a simulation
-        T (int): integer representing the number of timesteps for each simulation 
+        N: int
+            Number of trajectories to generate in a simulation
+        T: int
+            number of timesteps for each simulation
+        image_props: dict
+            Parameters needed for simulation
+        dt: int
+            Time step to be used for the simulation
+        fov: np.ndarray
+            Gives fov for viewing a simulation trajectory and used for random starting point in trajectory
          
     Returns:
         videos: np.ndarray 
@@ -99,14 +227,11 @@ def create_training_set_w_features(N: int, T: int, image_props: dict, dt: int=1,
         displacements: np.ndarray
                     Array of displacements between each pair of frames
         labels: np.ndarray
-                    Array of labels for each trajectory generated
+                    Array of labels for each trajectory generated 
     """
     # Generate random diffusion parameters
-    p1 = np.random.randint(image_props['D_min'], image_props['D_max']+1, size=N)
-    alpha = np.random.uniform(0.1, 1, size=N)
-    p2 = alpha*p1
-    theta = np.random.uniform(0, image_props['angle_max'], size=N)
-    
+    p1, p2, theta = generate_diffusion_props(N, image_props['D_min'], image_props['D_max'], image_props['angle_max'], is_isotropic=False)
+
     if fov is None:
         fov = np.array([128,128])
         
@@ -115,6 +240,87 @@ def create_training_set_w_features(N: int, T: int, image_props: dict, dt: int=1,
 
     # Get labels
     labels = np.stack((p1,p2,theta), axis=-1) # shape: (N,3)
+
+    # Convert trajectories of D (pixels^2/s) to D (micro_m^2/ms)
+    scaled_pos = pos / 100
+    videos, centroids = trajectories_to_videos_and_centroids(scaled_pos, image_props)
+
+    # Calculate relative displacement using centroids
+    _, nFrames, _ = centroids.shape
+    displacement = centroids[:, 1:, :] - centroids [:, :nFrames-1, :]
+    
+    return videos, displacement, labels
+
+def create_multi_state_dataset_w_features(N: int, T: int, image_props: dict, dt: int=1, fov: np.ndarray | None=None) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """
+    Creates a new dataset for 2-state particle simulations
+
+    Args:
+        N: int
+            Number of trajectories to generate in a simulation
+        T: int
+            number of timesteps for each simulation
+        image_props: dict
+            Parameters needed for simulation
+        dt: int
+            Time step to be used for the simulation
+        fov: np.ndarray
+            Gives fov for viewing a simulation trajectory and used for random starting point in trajectory
+         
+    Returns:
+        videos: np.ndarray 
+                    Array of images for each trajectory
+        displacements: np.ndarray
+                    Array of displacements between each pair of frames
+        labels: np.ndarray
+                    Array of labels for each trajectory generated 
+    """
+    # Generate random diffusion props for 1st state and 2nd state
+    p1_0, p2_0, theta_0 = generate_diffusion_props(N, image_props['D_min'], image_props['D_max'], image_props['angle_max'], is_isotropic=False)
+    alpha = np.random.uniform(0.1, 0.5, size=N)
+    p1_1 = alpha*p2_0
+    p2_1 = p1_1
+    theta_1 = np.zeros(N)
+    # p1_0, p2_0, theta_0 = generate_diffusion_props(N, image_props['D_min'], image_props['D_max'], image_props['angle_max'], is_isotropic=True)
+    # Or we could randomly choose the current 2nd state (small values) to be the first state s.t sometimes the particle loses confinement and diffuses quicker
+    
+    if fov is None:
+        fov = np.array([128,128])
+
+    # Get random point to make transition between states
+    T_0 = np.random.randint(T//6, 5*T//6, size=N)
+    # T_0 = np.random.randint(1, T, size=N)
+
+    # Make time-varying diffusion properties
+    p1 = np.zeros((N,T))
+    p2 = np.zeros_like(p1)
+    theta = np.zeros_like(p1)
+
+    for i in range(N):
+        p1[i] = np.concatenate((
+                    np.tile(p1_0[i, None], (1, T_0[i])),
+                    np.tile(p1_1[i, None], (1, T - T_0[i]))
+                ),
+                    axis=-1
+            )
+        p2[i] = np.concatenate((
+                    np.tile(p2_0[i, None], (1, T_0[i])),
+                    np.tile(p2_1[i, None], (1, T - T_0[i]))
+                ),
+                    axis=-1
+            )
+        theta[i] = np.concatenate((
+                    np.tile(theta_0[i, None], (1, T_0[i])),
+                    np.tile(theta_1[i, None], (1, T - T_0[i]))
+                ),
+                    axis=-1
+            )
+        
+    # Generate trajectories
+    pos = create_multi_state_trajectories(p1, p2, theta, fov, N, T, dt)
+
+    labels = np.stack((p1, p2, theta), axis=-1) # shape: (N,T,3)
+    labels = labels.reshape(N, image_props['frames'], -1, 3).mean(axis=2) # shape: (N,nFrames,3)
 
     # Convert trajectories of D (pixels^2/s) to D (micro_m^2/ms)
     scaled_pos = pos / 100
@@ -252,7 +458,7 @@ def trajectories_to_videos_and_centroids(pos: np.ndarray, image_props: dict) -> 
     centroids = np.zeros((N, nFrames, 2))
 
     for n in range(N):
-        generate_video(out_videos[n,:],pos[n,:],nFrames,output_size,upsampling_factor,nPosPerFrame,
+        generate_video_vectorized(out_videos[n,:],pos[n,:],nFrames,output_size,upsampling_factor,nPosPerFrame,
                                             gaussian_sigma,particle_mean,particle_std,background_mean,background_std, poisson_noise, gaussian_noise, centroids[n,:])
     
     videos = normalize_images(out_videos, background_mean, background_std, particle_mean + background_mean)
