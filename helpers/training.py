@@ -6,7 +6,7 @@ from torch.optim.lr_scheduler import ReduceLROnPlateau
 from torch.optim.lr_scheduler import CosineAnnealingLR
 from tqdm import tqdm
 
-def train_multi_modal(model: DiffusionTensorRegModel, N: int, T: int, props: dict, image_props: dict, device: torch.device, cycles: int, losses: list, vlosses: list):
+def train_multi_modal(model: DiffusionTensorRegModel, N: int, T: int, props: dict, image_props: dict, device: torch.device, cycles: int, losses: list, vlosses: list, val_path: str='data/validation_data.npz'):
     """
     Training for multimodal input
 
@@ -30,25 +30,12 @@ def train_multi_modal(model: DiffusionTensorRegModel, N: int, T: int, props: dic
         vlosses: list
             List to keep track of validation losses
     """
-    # Define optimizer and scheduler
-    optimizer = torch.optim.AdamW(model.parameters(), props['lr'], weight_decay=props.get('weight_decay', 0.01))
-    scheduler = ReduceLROnPlateau(optimizer, mode='min', factor=0.1, patience=3)
-
-    model.to(device)
-
-    # Get validation data
-    val_data = np.load('data/validation_data.npz')
-    val_videos = torch.Tensor(val_data['vids'])
-    val_displacements = torch.Tensor(val_data['disp'])
-    val_labels = torch.Tensor(val_data['labels'])
     D_max_normalization = image_props['D_max_norm']
-    val_labels = val_labels / np.array([D_max_normalization, D_max_normalization, 1])
 
-    val_dataset = VideoMotionDataset(val_videos, val_displacements, val_labels)
-    val_dataloader = DataLoader(val_dataset, batch_size=16, shuffle=False)
-    
     # Create training data
-    all_videos, all_displacements, all_labels = create_training_set_w_features(N, T, image_props) 
+    all_videos, all_displacements, all_labels = create_training_set_w_features(N, T, image_props)
+    disp_stats = compute_displacement_statistics(all_displacements)
+    all_displacements = normalize_displacements(all_displacements, disp_stats)
 
     # Normalize labels for better optimization
     all_labels = all_labels / np.array([D_max_normalization, D_max_normalization, 1])
@@ -61,6 +48,23 @@ def train_multi_modal(model: DiffusionTensorRegModel, N: int, T: int, props: dic
     # Create dataset and dataloader objects
     dataset = VideoMotionDataset(all_videos, all_displacements, all_labels)
     dataloader = DataLoader(dataset, batch_size=props['batch_size'], shuffle=True)
+
+    # Get validation data
+    val_data = np.load(val_path)
+    val_videos = torch.Tensor(val_data['vids'])
+    val_displacements = normalize_displacements(val_data['disp'], disp_stats)
+    val_displacements = torch.Tensor(val_displacements)
+    val_labels = torch.Tensor(val_data['labels'])
+    val_labels = val_labels / np.array([D_max_normalization, D_max_normalization, 1])
+
+    val_dataset = VideoMotionDataset(val_videos, val_displacements, val_labels)
+    val_dataloader = DataLoader(val_dataset, batch_size=16, shuffle=False)
+
+    # Define optimizer and scheduler
+    optimizer = torch.optim.AdamW(model.parameters(), props['lr'], weight_decay=props.get('weight_decay', 0.01))
+    scheduler = CosineAnnealingLR(optimizer, T_max=cycles, eta_min=1e-5)
+
+    model.to(device)
 
     # Training
     for epoch in tqdm(range(cycles), desc='Epochs of training'):
@@ -77,12 +81,12 @@ def train_multi_modal(model: DiffusionTensorRegModel, N: int, T: int, props: dic
 
             output = model(videos, displacements)
 
-            loss = props['loss_fn'](labels, output)
+            loss = props['loss_fn'](output, labels)
 
             batch_loss.append(loss.item())
             loss.backward()
             optimizer.step()
-            #scheduler.step()
+            scheduler.step()
 
         losses.append(np.mean(batch_loss))
 
@@ -100,17 +104,15 @@ def train_multi_modal(model: DiffusionTensorRegModel, N: int, T: int, props: dic
                 else:
                     val_predictions = model(videos)
 
-                l = props['loss_fn'](labels, val_predictions)
+                l = props['loss_fn'](val_predictions, labels)
                 batch_vloss.append(l.item())
             vlosses.append(np.mean(batch_vloss))
-
-        # Update scheduler with loss from validation
-        scheduler.step(vlosses[-1])
-
+        
         print(f"Epoch {epoch+1}/{cycles} | Train Loss: {losses[-1]:.4f} | Val Loss: {vlosses[-1]:.4f}")
+    
+    return disp_stats 
 
-
-def train_single_mode(model: DiffusionTensorRegModelBase, N: int, T: int, props: dict, image_props: dict, device: torch.device, cycles: int, losses: list, vlosses: list):
+def train_single_mode(model: DiffusionTensorRegModelBase, N: int, T: int, props: dict, image_props: dict, device: torch.device, cycles: int, losses: list, vlosses: list, val_path: str='data/validation_data.npz'):
     """
     Training for image only input
 
@@ -137,14 +139,14 @@ def train_single_mode(model: DiffusionTensorRegModelBase, N: int, T: int, props:
     model.to(device)
 
     # Get validation data
-    val_data = np.load('data/validation_data.npz')
+    val_data = np.load(val_path)
     val_videos = torch.Tensor(val_data['vids'])
     val_labels = torch.Tensor(val_data['labels'])
     D_max_normalization = image_props['D_max_norm']
     val_labels = val_labels / np.array([D_max_normalization, D_max_normalization, 1])
 
     val_dataset = VideoDataset(val_videos, val_labels)
-    val_dataloader = DataLoader(val_dataset, batch_size=16, shuffle=False)
+    val_dataloader = DataLoader(val_dataset, batch_size=32, shuffle=True)
     
     # Create training data
     all_videos, all_labels = create_training_set(N, T, image_props) 
@@ -174,7 +176,7 @@ def train_single_mode(model: DiffusionTensorRegModelBase, N: int, T: int, props:
 
             output = model(videos)
 
-            loss = props['loss_fn'](labels, output)
+            loss = props['loss_fn'](output, labels)
             
             batch_loss.append(loss.item())
             loss.backward()
@@ -194,13 +196,13 @@ def train_single_mode(model: DiffusionTensorRegModelBase, N: int, T: int, props:
 
                 val_predictions = model(videos)
 
-                l = props['loss_fn'](labels, val_predictions)
+                l = props['loss_fn'](val_predictions, labels)
                 batch_vloss.append(l.item())
             vlosses.append(np.mean(batch_vloss))
 
         print(f"Epoch {epoch+1}/{cycles} | Train Loss: {losses[-1]:.4f} | Val Loss: {vlosses[-1]:.4f}")
 
-def train_disp_mode(model: DisplacementBasedModel, N: int, T: int, props: dict, image_props: dict, device: torch.device, cycles: int, losses: list, vlosses: list):
+def train_disp_mode(model: DisplacementBasedModel, N: int, T: int, props: dict, image_props: dict, device: torch.device, cycles: int, losses: list, vlosses: list, val_path: str='data/validation_data.npz'):
     """
     Training for displacement only input
 
@@ -224,24 +226,12 @@ def train_disp_mode(model: DisplacementBasedModel, N: int, T: int, props: dict, 
         vlosses: list
             List to keep track of validation losses
     """
-    # Define optimizer and scheduler
-    optimizer = torch.optim.AdamW(model.parameters(), props['lr'], weight_decay=props.get('weight_decay', 0.001))
-    scheduler = CosineAnnealingLR(optimizer, T_max=cycles, eta_min=1e-5)
-
-    model.to(device)
-
-    # Get validation data
-    val_data = np.load('data/validation_data.npz')
-    val_displacements = torch.Tensor(val_data['disp'])
-    val_labels = torch.Tensor(val_data['labels'])
     D_max_normalization = image_props['D_max_norm']
-    val_labels = val_labels / np.array([D_max_normalization, D_max_normalization, 1])
 
-    val_dataset = DisplacementDataset(val_displacements, val_labels)
-    val_dataloader = DataLoader(val_dataset, batch_size=16, shuffle=False)
-    
     # Create training data
-    _, all_displacements, all_labels = create_training_set_w_features(N, T, image_props) 
+    _, all_displacements, all_labels = create_training_set_w_features(N, T, image_props)
+    disp_stats = compute_displacement_statistics(all_displacements)
+    all_displacements = normalize_displacements(all_displacements, disp_stats)
 
     # Normalize labels for better optimization
     all_labels = all_labels / np.array([D_max_normalization, D_max_normalization, 1])
@@ -253,6 +243,22 @@ def train_disp_mode(model: DisplacementBasedModel, N: int, T: int, props: dict, 
     # Create dataset and dataloader objects
     dataset = DisplacementDataset(all_displacements, all_labels)
     dataloader = DataLoader(dataset, batch_size=props['batch_size'], shuffle=True)
+
+    # Get validation data
+    val_data = np.load(val_path)
+    val_displacements = normalize_displacements(val_data['disp'], disp_stats)
+    val_displacements = torch.Tensor(val_displacements)
+    val_labels = torch.Tensor(val_data['labels'])
+    val_labels = val_labels / np.array([D_max_normalization, D_max_normalization, 1])
+
+    val_dataset = DisplacementDataset(val_displacements, val_labels)
+    val_dataloader = DataLoader(val_dataset, batch_size=32, shuffle=True)
+
+    # Define optimizer and scheduler
+    optimizer = torch.optim.AdamW(model.parameters(), props['lr'], weight_decay=props.get('weight_decay', 0.01))
+    scheduler = CosineAnnealingLR(optimizer, T_max=cycles, eta_min=1e-5)
+    
+    model.to(device)
 
     # Training
     for epoch in tqdm(range(cycles), desc='Epochs of training'):
@@ -268,7 +274,7 @@ def train_disp_mode(model: DisplacementBasedModel, N: int, T: int, props: dict, 
 
             output = model(displacements)
 
-            loss = props['loss_fn'](labels, output)
+            loss = props['loss_fn'](output, labels)
 
             batch_loss.append(loss.item())
             loss.backward()
@@ -288,13 +294,15 @@ def train_disp_mode(model: DisplacementBasedModel, N: int, T: int, props: dict, 
                 
                 val_predictions = model(displacements)
 
-                l = props['loss_fn'](labels, val_predictions)
+                l = props['loss_fn'](val_predictions, labels)
                 batch_vloss.append(l.item())
             vlosses.append(np.mean(batch_vloss))
 
         print(f"Epoch {epoch+1}/{cycles} | Train Loss: {losses[-1]:.4f} | Val Loss: {vlosses[-1]:.4f}")
+    
+    return disp_stats
 
-def train_multi_state(model: MultiStateModel, N: int, T: int, props: dict, image_props: dict, device: torch.device, cycles: int, losses: list, vlosses: list):
+def train_multi_state(model: MultiStateModel, N: int, T: int, props: dict, image_props: dict, device: torch.device, cycles: int, losses: list, vlosses: list, val_path: str, binding: bool=False, is_baseline: bool=False):
     """
     Training for multi-state input
 
@@ -318,29 +326,32 @@ def train_multi_state(model: MultiStateModel, N: int, T: int, props: dict, image
         vlosses: list
             List to keep track of validation losses
     """ 
+    D_max_normalization = image_props['D_max_norm']
+
+    # Create training data
+    all_videos, all_displacements, all_labels = create_multi_state_dataset_w_features(N, T, image_props, binding=binding) 
+    disp_stats = compute_displacement_statistics(all_displacements)
+    all_displacements = normalize_displacements(all_displacements, disp_stats)
+
+    # Get validation data
+    val_data = np.load(val_path)
+    val_videos = torch.Tensor(val_data['vids'])
+    val_displacements = normalize_displacements(val_data['disp'], disp_stats)
+    val_displacements = torch.Tensor(val_displacements)
+    val_labels = torch.Tensor(val_data['labels'])
+    val_labels = val_labels / np.array([D_max_normalization, D_max_normalization, 1])
+
+    val_dataset = VideoMotionDataset(val_videos, val_displacements, val_labels)
+    val_dataloader = DataLoader(val_dataset, batch_size=32, shuffle=True)
+    
+    # Normalize labels for better optimization
+    all_labels = all_labels / np.array([D_max_normalization, D_max_normalization, 1])
     # Define optimizer and scheduler
     optimizer = torch.optim.AdamW(model.parameters(), props['lr'], weight_decay=props.get('weight_decay', 0.01))
     scheduler = CosineAnnealingLR(optimizer, T_max=cycles, eta_min=1e-5)
 
     model.to(device)
 
-    # Get validation data
-    val_data = np.load('data/multi_state.npz')
-    val_videos = torch.Tensor(val_data['vids'])
-    val_displacements = torch.Tensor(val_data['disp'])
-    val_labels = torch.Tensor(val_data['labels'])
-    D_max_normalization = image_props['D_max_norm']
-    val_labels = val_labels / np.array([D_max_normalization, D_max_normalization, 1])
-
-    val_dataset = VideoMotionDataset(val_videos, val_displacements, val_labels)
-    val_dataloader = DataLoader(val_dataset, batch_size=32, shuffle=False)
-    
-    # Create training data
-    all_videos, all_displacements, all_labels = create_multi_state_dataset_w_features(N, T, image_props) 
-
-    # Normalize labels for better optimization
-    all_labels = all_labels / np.array([D_max_normalization, D_max_normalization, 1])
-    
     # Convert to tensors
     all_videos = torch.Tensor(all_videos)
     all_labels = torch.Tensor(all_labels)
@@ -363,9 +374,12 @@ def train_multi_state(model: MultiStateModel, N: int, T: int, props: dict, image
 
             optimizer.zero_grad()
 
-            output = model(videos, displacements)
-
-            loss = props['loss_fn'](labels, output)
+            if not is_baseline:
+                output = model(videos, displacements)
+            else:
+                output = model(videos)
+                
+            loss = props['loss_fn'](output, labels)
 
             batch_loss.append(loss.item())
             loss.backward()
@@ -383,10 +397,15 @@ def train_multi_state(model: MultiStateModel, N: int, T: int, props: dict, image
                 displacements = displacements.to(device)
                 labels = labels.to(device)                
 
-                val_predictions = model(videos, displacements)
+                if not is_baseline:
+                    val_predictions = model(videos, displacements)
+                else:
+                    val_predictions = model(videos)
 
-                l = props['loss_fn'](labels, val_predictions)
+                l = props['loss_fn'](val_predictions, labels)
                 batch_vloss.append(l.item())
             vlosses.append(np.mean(batch_vloss))
 
         print(f"Epoch {epoch+1}/{cycles} | Train Loss: {losses[-1]:.4f} | Val Loss: {vlosses[-1]:.4f}")
+    
+    return disp_stats

@@ -1,4 +1,5 @@
 from types import LambdaType
+import numpy as np
 import torch
 import torch.nn as nn
 from torch.utils.data import Dataset, DataLoader
@@ -62,7 +63,7 @@ class MultiheadAttention(nn.Module):
     """
     Object for representing multi-head attention
     """
-    def __init__(self, embed_dim: int, num_heads: int, dropout: float=0.0, use_rotary=True):
+    def __init__(self, embed_dim: int, num_heads: int, dropout: float=0.0, use_rotary=False):
         super().__init__()
         self.embed_dim = embed_dim
         self.num_heads = num_heads
@@ -113,7 +114,7 @@ class CrossAttention(nn.Module):
     """
     Object for representing cross attention
     """
-    def __init__(self, embed_dim: int, num_heads: int, dropout: float=0.0, use_rotary=True):
+    def __init__(self, embed_dim: int, num_heads: int, dropout: float=0.0, use_rotary=False):
         super().__init__()
         self.embed_dim = embed_dim
         self.num_heads = num_heads
@@ -274,6 +275,20 @@ class CrossTransformerBlock(nn.Module):
         tokens_a = self.apply_subblock(tokens_a, self.mlp_a, self.norm2_a)
         tokens_b = self.apply_subblock(tokens_b, self.mlp_b, self.norm2_b)
 
+        # # Pre-norm cross-attention
+        # a_attn, b_attn = self.cross_attn(
+        #     self.norm1_a(tokens_a),
+        #     self.norm1_b(tokens_b)
+        # )
+
+        # tokens_a = tokens_a + self.dropout(a_attn)
+        # tokens_b = tokens_b + self.dropout(b_attn)
+
+        # # Pre-norm feedforward
+        # tokens_a = tokens_a + self.dropout(self.mlp_a(self.norm2_a(tokens_a)))
+        # tokens_b = tokens_b + self.dropout(self.mlp_b(self.norm2_b(tokens_b)))
+
+
         return tokens_a, tokens_b
     
     def apply_subblock(self, x: torch.Tensor, sublayer: LambdaType, norm: LambdaType):
@@ -330,14 +345,13 @@ class CrossTransformer(nn.Module):
         super().__init__()
         self.embed_dim = embed_dim
         if use_pos_encoding and use_rotary:
-            print('Only apply Sinusoidal or RoPE embeddings, not both!')
+            print('Only apply Sinusoidal or RoPE embeddings, not both! Defaulting to RoPE')
             use_pos_encoding = False
         self.use_pos_embed = use_pos_encoding
         self.use_seg_embed = use_segment_embed
 
         # Positional embeddings
         if self.use_pos_embed:
-            #self.pos_embedding = nn.Parameter(torch.rand(1, MAX_TOKENS, embed_dim))
             self.add_pos_embed = SinusoidalPositionEmbedding(embed_dim)
             
         # Segment embeddings: 0 = tokens_a, 1 = tokens_b
@@ -872,8 +886,9 @@ class LSTM(nn.Module):
     """
     Object representing a LSTM model for comparison to transformer implementation
     """
-    def __init__(self, embed_dim: int, hidden_dim: int, num_layers: int, output_dim: int=4, bidirectional: bool=False, dropout: float=0):
+    def __init__(self, embed_dim: int, hidden_dim: int, num_layers: int, output_dim: int=4, bidirectional: bool=False, dropout: float=0, pointwise: bool=False):
         super().__init__()
+        self.pointwise = pointwise
         self.image_encoder = DeepResNetEmbedding(embed_dim)
         self.norm = nn.LayerNorm(embed_dim)
         self.lstm = nn.LSTM(embed_dim, hidden_dim, num_layers, batch_first=True, bidirectional=bidirectional, dropout=dropout)
@@ -889,15 +904,18 @@ class LSTM(nn.Module):
 
         # Process temporal sequence
         lstm_out, _ = self.lstm(frame_features)
-        if self.lstm.bidirectional:
-            forward_last = lstm_out[:, -1, :self.lstm.hidden_size]   # forward final timestep
-            backward_last = lstm_out[:, 0, self.lstm.hidden_size:]   # backward first timestep
-            last_hidden = torch.cat([forward_last, backward_last], dim=-1)  # shape (B, 2*hidden_size)
+        if not self.pointwise:
+            if self.lstm.bidirectional:
+                forward_last = lstm_out[:, -1, :self.lstm.hidden_size]   # forward final timestep
+                backward_last = lstm_out[:, 0, self.lstm.hidden_size:]   # backward first timestep
+                mlp_input = torch.cat([forward_last, backward_last], dim=-1)  # shape (B, 2*hidden_size)
+            else:
+                mlp_input = lstm_out[:, -1, :]
         else:
-            last_hidden = lstm_out[:, -1, :]
+            mlp_input = lstm_out
 
         # Regression output
-        out = self.fc(last_hidden)
+        out = self.fc(mlp_input)
 
         return out
 
@@ -905,9 +923,12 @@ class Pix2D(nn.Module):
     """
     Object representing the model used in the Pix2D paper https://github.com/ha-park/Pix2D-NN-diffusivity-mapping
     """
-    def __init__(self, n_channel=16, output_dim=4):
+    def __init__(self, n_channel=16, output_dim=4, pointwise=False):
         super().__init__()
 
+        # Whether the model should make predictions per-frame or not
+        self.pointwise = pointwise
+        
         self.model = nn.Sequential(
             # First conv block
             nn.Conv2d(1, n_channel*2, kernel_size=3, padding=1),  # 'same' padding
@@ -957,55 +978,89 @@ class Pix2D(nn.Module):
         x = self.model(x)
 
         x = x.view(batch_size, num_images, -1)
-        x = x.mean(dim=1)
+        if not self.pointwise:
+            x = x.mean(dim=1)
 
         return self.fc(x)
 
 # -----------------------------------------------------------------------------------------
 # Loss function helpers
 
-def construct_matrix_log(log_p1: torch.Tensor, log_p2: torch.Tensor, theta: torch.Tensor) -> torch.Tensor:
+def construct_matrix(p1: torch.Tensor, p2: torch.Tensor, theta: torch.Tensor) -> torch.Tensor:
     """
-    Construct matrix log from log(eigenvalues) and angles
+    Construct matrix from eigenvalues and angles
 
     Args:
-        log_p1: torch.Tensor (batch_size,)
-            Log(eigenvalues) in the first prinicipal component
-        log_p2: torch.Tensor (batch_size,)
-            Log(eigenvalues) in the second principal component
-        theta: torch.Tensor (batch_size,)
+        p1: torch.Tensor (batch_size,) or (batch_size, nFrames)
+            Eigenvalues in the first prinicipal component
+        p2: torch.Tensor (batch_size,) or (batch_size, nFrames)
+            Eigenvalues in the second principal component
+        theta: torch.Tensor (batch_size,) or (batch_size, nFrames)
             Angle with respect to the x-axis of the eigenvector associated with the first prinicipal component
 
     Returns:
-        mlog: torch.Tensor (batch_size, 2, 2)
-            Matrix logarithm for each instance in a batch
+        m: torch.Tensor (batch_size, 2, 2) or (batch_size, nFrames, 2, 2)
+            Matrix for each instance in a batch
     """
 
     # Define rotation matrices
-    c = torch.cos(theta) # (batch_size,)
-    s = torch.sin(theta) # (batch_size,)
+    c = torch.cos(theta)
+    s = torch.sin(theta)
 
     R_pred = torch.stack([
         torch.stack([c, -s], dim=-1),
         torch.stack([s, c], dim=-1)
-    ], dim=-2) # (batch_size, 2, 2)
+    ], dim=-2)
 
 
     # Define diagonals
-    log_eig = torch.stack([log_p1, log_p2], dim=-1)
+    eig = torch.stack([p1, p2], dim=-1)
     
     # Compute matrix logarithms of predictions and labels
-    mlog = R_pred @ torch.diag_embed(log_eig) @ R_pred.transpose(-1,-2)
+    m = R_pred @ torch.diag_embed(eig) @ R_pred.transpose(-1,-2)
 
-    return mlog
+    return m
 
-def log_euclidean_loss(labels: torch.Tensor, predictions: torch.Tensor, angle_reg: float=1) -> torch.Tensor:
+def log_euclidean_distance(predictions: torch.Tensor, labels: torch.Tensor) -> torch.Tensor:
+    """
+    Log-Euclidean distance
+
+    Args:
+        predictions: torch.Tensor (batch_size, 4) or (batch_size, nFrames, 4)
+        labels: torch.Tensor (batch_size, 3) or (batch_size, nFrames, 3)
+    
+    Returns:
+        d: torch.Tensor (batch_size,) or (batch_size, nFrames)
+            Distance computed via the log-euclidean distance metric
+
+    Diffusion tensor is a symmetric positive definite matrix so we can easily decompose into eigenvalues and eigenvectors using:
+        
+    D = R @ diag(eigenvalues) @ R^T where R is the rotation matrix
+
+    Matrix logarithm is built by decomposing a matrix and taking the natural logarithm of the eigenvalues then reconstructing 
+    """
+    # Decompose to each parameter
+    p1_pred, p2_pred, sin_2theta_pred, cos_2theta_pred = predictions[...,0], predictions[...,1], predictions[...,2], predictions[...,3]
+    p1_label, p2_label, theta_label = labels[...,0], labels[...,1], labels[...,2]
+
+    # Compute matrix log for predictions and labels
+    theta_pred = 0.5 * torch.atan2(sin_2theta_pred, cos_2theta_pred)
+
+    mlog_pred = construct_matrix(torch.log(p1_pred), torch.log(p2_pred), theta_pred) # handle whether or not to apply log on predictions based on model output
+    mlog_label = construct_matrix(torch.log(p1_label), torch.log(p2_label), theta_label)
+
+    # Compute distance w/ squared Frobenious norm
+    d = torch.linalg.norm(mlog_pred - mlog_label, dim=(-2,-1))
+    
+    return d
+
+def log_euclidean_loss(predictions: torch.Tensor, labels: torch.Tensor) -> torch.Tensor:
     """
     Log-Euclidean loss function
 
     Args:
-        labels: torch.Tensor (batch_size, 3)
-        predictions: torch.Tensor (batch_size, 3)
+        predictions: torch.Tensor (batch_size, 4) or (batch_size, nFrames, 4)
+        labels: torch.Tensor (batch_size, 3) or (batch_size, nFrames, 3)
     
     Returns:
         loss: torch.Tensor (1,)
@@ -1017,43 +1072,20 @@ def log_euclidean_loss(labels: torch.Tensor, predictions: torch.Tensor, angle_re
 
     Matrix logarithm is built by decomposing a matrix and taking the natural logarithm of the eigenvalues then reconstructing 
     """
-    # Decompose to each parameter
-    p1_pred, p2_pred, sin_2theta_pred, cos_2theta_pred = predictions[:,0], predictions[:,1], predictions[:,2], predictions[:,3]
-    p1_label, p2_label, theta_label = labels[:,0], labels[:,1], labels[:,2]
+    # Compute distance between predictions
+    d = log_euclidean_distance(predictions, labels)
 
-    # Compute matrix log for predictions and labels
-    theta_pred = 0.5 * torch.atan2(sin_2theta_pred, cos_2theta_pred)
-
-    mlog_pred = construct_matrix_log(p1_pred, p2_pred, theta_pred)
-    mlog_label = construct_matrix_log(torch.log(p1_label), torch.log(p2_label), theta_label)
-
-    # Compute loss across batch w/ squared Frobenious norm
-    loss = torch.mean(torch.linalg.norm(mlog_pred - mlog_label, dim=(1,2))**2)
-
-    # Angle regularization
-    # norm_error = (sin_2theta_pred**2 + cos_2theta_pred**2 - 1)**2
-    # loss_angle_reg = torch.mean(norm_error)
-    sin_2theta_true = torch.sin(2 * theta_label)
-    cos_2theta_true = torch.cos(2 * theta_label)
-    loss_angle_reg = ((sin_2theta_pred - sin_2theta_true)**2 + (cos_2theta_pred - cos_2theta_true)**2).mean()
-    
-    # reconstruct predicted eigenvalues (not log)
-    p1_pred2, p2_pred2 = torch.exp(predictions[:,0]), torch.exp(predictions[:,1])
-
-    # mean diffusivity penalty (physical space)
-    L_scale = torch.mean((p1_pred2 - p1_label)**2 + (p2_pred2 - p2_label)**2)
-
-    # combined loss
-    loss = loss #+ 0.5*loss_angle_reg + 0.1*L_scale
+    # Compute loss across batch
+    loss = torch.mean(d)
     
     return loss
 
-def mse_loss(labels: torch.Tensor, predictions: torch.Tensor) -> torch.Tensor:
+def mse_loss(predictions: torch.Tensor, labels: torch.Tensor) -> torch.Tensor:
     """
     MSE loss function
     Args:
-        labels: torch.Tensor (batch_size, 3) or (batch_size, nFrames, 3)
         predictions: torch.Tensor (batch_size, 4) or (batch_size, nFrames, 4)
+        labels: torch.Tensor (batch_size, 3) or (batch_size, nFrames, 3)
 
     Returns:
         loss: torch.Tensor (1,)
@@ -1065,7 +1097,7 @@ def mse_loss(labels: torch.Tensor, predictions: torch.Tensor) -> torch.Tensor:
     sin_2theta_pred = predictions[..., 2]
     cos_2theta_pred = predictions[..., 3]
 
-    # Normalize predicted sin/cos to unit circle
+    # Normalize predicted sin/cos
     norm = torch.sqrt(sin_2theta_pred**2 + cos_2theta_pred**2 + 1e-8)
     sin_2theta_pred = sin_2theta_pred / norm
     cos_2theta_pred = cos_2theta_pred / norm
@@ -1081,17 +1113,76 @@ def mse_loss(labels: torch.Tensor, predictions: torch.Tensor) -> torch.Tensor:
 
     return (mse_diffusion + mse_angle).mean()
 
-def mse_loss_coeff(labels: torch.Tensor, predictions: torch.Tensor) -> torch.Tensor:
+def mse_loss_coeff(predictions: torch.Tensor, labels: torch.Tensor) -> torch.Tensor:
     """
     MSE loss function for purely diffusion coefficient predictions
     Args:
-        labels: torch.Tensor (batch_size, 3) or (batch_size, nFrames, 3)
         predictions: torch.Tensor (batch_size, 4) or (batch_size, nFrames, 4)
+        labels: torch.Tensor (batch_size, 3) or (batch_size, nFrames, 3)
     Returns:
         loss: torch.Tensor (1,)
             Loss computed via the MSE metric
     """
     return torch.mean((predictions - labels[..., :-1])**2)
+
+def mse_similarity(predictions: torch.Tensor, labels: torch.Tensor):
+    """
+    Compute similarity of two diffusion tensors based on Euclidean distance and RBF kernel
+    """
+    # Compute diffusion tensors
+    theta_pred = 0.5 * torch.atan2(predictions[..., -2], predictions[..., -1])
+    m1 = construct_matrix(predictions[..., 0], predictions[..., 1], theta_pred)
+    m2 = construct_matrix(labels[..., 0], labels[..., 1], labels[..., -1])
+
+    # Compute Frobenius norm
+    d = torch.linalg.norm(m1 - m2, dim=(-2,-1))
+
+    # Convert distance to a similarity
+    gamma = 1
+    similarity = torch.mean(torch.exp(-gamma * d ** 2))
+
+    return similarity 
+
+def get_changepoints(x: np.ndarray):
+    """
+    In a two-state scenario, find where the changepoint is located. Goal is to minimize the variance of each side according to the split index
+    
+    Args:
+        x: (N, nFrames, 2)
+            Array containing the pointwise diffusion coefficient
+    Returns:
+        changepoints: (N,2)
+            Changepoints per data entry and diffusion coeffcient 
+    """
+    N, nFrames, _ = x.shape
+    
+    cost = np.zeros((N, nFrames-1))
+    for j in range(1,nFrames):
+        # Compute cost / variance of each side of split point
+        mean1 = np.mean(x[:, :j], axis=1, keepdims=True)
+        mean2 = np.mean(x[:, j:], axis=1, keepdims=True)
+        cost[:, j-1] = np.sum((x[:, :j] - mean1)**2, axis=(1,2)) + np.sum((x[:, j:] - mean2)**2, axis=(1,2)) # sum cost over both predictions D_1 and D_2
+    
+    return np.argmin(cost, axis=1)
+
+def compute_changepoint_error(pred: np.ndarray, labels: np.ndarray):
+    """
+    Compute the error between predictions and labels changepoint values
+    
+    Args:
+        pred: (N, nFrames, 4)
+            Multistate model predictions
+        labels: (N, nFrames, 3)
+            Multistate model labels
+    
+    Returns:
+        loss:
+            Average error between prediction and label
+    """
+    changepoints_pred = get_changepoints(pred[..., :2])
+    changepoints_labels = get_changepoints(labels[...,:-1])
+    
+    return np.abs(changepoints_pred - changepoints_labels).mean()
 
 # -----------------------------------------------------------------------------------------
 # Positional embeddings helpers

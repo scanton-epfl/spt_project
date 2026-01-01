@@ -11,7 +11,7 @@ def compute_covariance_matrix(trajectories):
     """
 
     nparticles, num_steps, d = trajectories.shape
-    taus = np.arange(1, num_steps//4)
+    taus = np.arange(1, num_steps//10)
     C_tensors = np.zeros((nparticles, len(taus), d, d))
 
     for p in range(nparticles):
@@ -87,7 +87,7 @@ def plotMSD(C, taus):
     # Set plot details
     plt.title("Mean Square Displacement (MSD) vs Time Lag")
     plt.xlabel("Time Lag")
-    plt.ylabel("MSD (pixels^2)")
+    plt.ylabel(r"MSD ($\mu m^2$)")
     plt.grid(True)
     plt.tight_layout()
     plt.show()

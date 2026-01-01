@@ -1,2 +1,10 @@
 helpers/__pycache__/
 data/
+__pycache__/
+experiments/psf_models
+experiments/noise_models
+training.png
+results/
+*.gif
+*.png
+results_final/
