@@ -323,7 +323,6 @@ def create_multi_state_dataset_w_features(N: int, T: int, image_props: dict, dt:
         print("Creating a binding dataset")
         
         bind_min, bind_max = 0.005, 0.01
-        #bind_min, bind_max = 0.5, 1
         n = N//2
 
         # First state
@@ -340,9 +339,6 @@ def create_multi_state_dataset_w_features(N: int, T: int, image_props: dict, dt:
     p1_0, p2_0, theta_0 = props_0[:, 0], props_0[:, 1], props_0[:, 2]
     p1_1, p2_1, theta_1 = props_1[:, 0], props_1[:, 1], props_1[:, 2]
    
-    # if fov is None:
-    #     fov = np.array([128,128])
-
     # Get random point to make transition between states
     #T_0 = np.random.randint(T//6, 5*T//6, size=N)
     T_0 = np.random.randint(1, T, size=N)
@@ -599,24 +595,11 @@ def generate_video_vectorized(out_video: np.ndarray, trajectory: np.ndarray, nFr
     xc = traj_centered[..., 0]
     yc = traj_centered[..., 1]
     
-#     psf_radius = 0 #1.17*gaussian_sigma
-#     out_of_frame = (
-#     (xc - psf_radius < -limit) |
-#     (xc + psf_radius >  limit) |
-#     (yc - psf_radius < -limit) |
-#     (yc + psf_radius >  limit)
-# )  # shape: (nFrames, nPosPerFrame)
-    
-#     assert np.any(out_of_frame) == False
-#     print("PSF leaves frame: ", np.any(out_of_frame, axis=1).mean())
-#     print("Grid half width (upsampled px):", grid_size / 2)
-#     print("PSF sigma (upsampled px):", gaussian_sigma)
-
     # Generate random variables
     frame_intensity = np.random.normal(particle_mean, particle_std, size=(nFrames,1,1))
     spot_intensity = frame_intensity / nPosPerFrame
 
-    # Vectorized Gaussian computation for all particles
+    # Gaussian computation for all particles
     x_diff = xx[None, None, :, :] - xc[:, :, None, None]
     y_diff = yy[None, None, :, :] - yc[:, :, None, None]
     gaussians = np.exp(-(x_diff**2 + y_diff**2) / (2 * gaussian_sigma**2)) # (nFrames, nPosPerFrame, grid_size, grid_size)

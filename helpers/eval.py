@@ -166,8 +166,8 @@ def multi_state_eval(all_videos: np.ndarray, all_displacements: np.ndarray | Non
                     mae.cpu() * D_max_normalization,
                     angle_sim.cpu()
                 ], axis=0))
-            mse_sims.append(sims.cpu())  
-                      
+            mse_sims.append(sims.cpu())
+            
         # Compute average across all labels
         avg_loss = np.mean(loss)
         avg_error = np.mean(errors, axis=0)
@@ -175,6 +175,132 @@ def multi_state_eval(all_videos: np.ndarray, all_displacements: np.ndarray | Non
         print(f"Average loss across validation set: {avg_loss}")
         print(f"Average MAE of diffusion coefficients and angle simularity across validation set: {avg_error}")
         print(f"Average L2-based similarity of diffusion tensors across validation set: {avg_sim}")
+        print(50*'-')
+
+    return avg_loss, avg_sim
+
+def single_state_sliding_window_eval(all_videos: np.ndarray, all_displacements: np.ndarray | None, og_labels: np.ndarray, model, disp_stats: dict | None, model_props: dict, image_props: dict, device, window_size: int=5) -> np.float32:
+    """
+    Evaluation using single state model for multi-state predictions
+    """
+    # Get tensors and normalize displacements
+    D_max_normalization = image_props['D_max_norm']
+    all_videos, all_displacements, all_labels = convert_and_get_tensors(all_videos, all_displacements, og_labels, disp_stats, D_max_normalization)
+
+    # Create dataset and dataloader
+    if all_displacements is not None:
+        dataset = VideoMotionDataset(all_videos, all_displacements, all_labels)
+    else:
+        dataset = VideoDataset(all_videos, all_labels)
+        
+    dataloader = DataLoader(dataset, batch_size=32, shuffle=True)
+
+    model.eval()
+    with torch.no_grad():
+        loss = []
+        errors = []
+        mse_sims = []
+        for videos, displacements, labels in dataloader:
+            videos = videos.to(device)
+            labels = labels.to(device)
+            
+            batch_loss = []
+            batch_errors = []
+            for i in range(0, videos.shape[1], window_size):
+                end_index = i + window_size if i + window_size < videos.shape[1] else videos.shape[1]
+                l = labels[:, i:end_index].mean(dim=1)
+                
+                if displacements.numel() != 0:
+                    d = displacements[:, i:end_index].to(device)
+                    val_predictions = model(videos[:,i:end_index], d)
+                else:
+                    val_predictions = model(videos[:,i:end_index])
+
+                val_loss = model_props['loss_fn'](val_predictions, l)
+                batch_loss.append(val_loss.item()) # batch loss
+
+                angle_pred = 0.5 * torch.atan2(val_predictions[...,2], val_predictions[...,3])
+                
+                #mse = ((val_predictions[...,:-2] - labels[...,:-1])**2).mean(axis=((0,1) if labels.dim()==3 else 0))
+                mae = (val_predictions[...,:-2] - l[...,:-1]).abs().mean(axis=((0,1) if l.dim()==3 else 0))
+
+                angle_sim = torch.abs(torch.cos(angle_pred - l[...,-1])).mean().unsqueeze(-1)
+                
+                batch_errors.append(torch.cat([
+                    mae.cpu() * D_max_normalization,
+                    angle_sim.cpu()
+                ], axis=0))
+                
+            loss.append(np.mean(batch_loss))
+            errors.append(np.mean(batch_errors, axis=0))
+            
+        # Compute average across all labels
+        avg_loss = np.mean(loss)
+        avg_error = np.mean(errors, axis=0)
+        avg_sim = np.mean(mse_sims)
+        print(f"Average loss across validation set: {avg_loss}")
+        print(f"Average MAE of diffusion coefficients and angle simularity across validation set: {avg_error}")
+        print(50*'-')
+
+    return avg_loss, avg_sim
+
+def single_state_sliding_window_eval_iso(all_videos: np.ndarray, all_displacements: np.ndarray | None, og_labels: np.ndarray, model, disp_stats: dict | None, model_props: dict, image_props: dict, device, window_size: int=5) -> np.float32:
+    """
+    Evaluation using single state model for multi-state predictions - isotropic
+    """
+    # Get tensors and normalize displacements
+    D_max_normalization = image_props['D_max_norm']
+    all_videos, all_displacements, all_labels = convert_and_get_tensors(all_videos, all_displacements, og_labels, disp_stats, D_max_normalization)
+
+    # Create dataset and dataloader
+    if all_displacements is not None:
+        dataset = VideoMotionDataset(all_videos, all_displacements, all_labels)
+    else:
+        dataset = VideoDataset(all_videos, all_labels)
+        
+    dataloader = DataLoader(dataset, batch_size=32, shuffle=True)
+
+    model.eval()
+    with torch.no_grad():
+        loss = []
+        errors = []
+        mse_sims = []
+        for videos, displacements, labels in dataloader:
+            videos = videos.to(device)
+            labels = labels.to(device)
+            
+            batch_loss = []
+            batch_errors = []
+            for i in range(0, videos.shape[1], window_size):
+                end_index = i + window_size if i + window_size < videos.shape[1] else videos.shape[1]
+                l = labels[:, i:end_index].mean(dim=1)
+                
+                if displacements.numel() != 0:
+                    d = displacements[:, i:end_index].to(device)
+                    val_predictions = model(videos[:,i:end_index], d)
+                else:
+                    val_predictions = model(videos[:,i:end_index])
+
+                val_loss = model_props['loss_fn'](val_predictions, l)
+                batch_loss.append(val_loss.item()) # batch loss
+
+                #mse = ((val_predictions[...,:-2] - labels[...,:-1])**2).mean(axis=((0,1) if labels.dim()==3 else 0))
+                mae = (val_predictions[...,:-2] - l[...,:-1]).abs().mean(axis=((0,1) if l.dim()==3 else 0))
+
+                
+                batch_errors.append(torch.cat([
+                    mae.cpu() * D_max_normalization,
+                ], axis=0))
+                
+            loss.append(np.mean(batch_loss))
+            errors.append(np.mean(batch_errors, axis=0))
+            
+        # Compute average across all labels
+        avg_loss = np.mean(loss)
+        avg_error = np.mean(errors, axis=0)
+        avg_sim = np.mean(mse_sims)
+        print(f"Average loss across validation set: {avg_loss}")
+        print(f"Average MAE of diffusion coefficients across validation set: {avg_error}")
         print(50*'-')
 
     return avg_loss, avg_sim

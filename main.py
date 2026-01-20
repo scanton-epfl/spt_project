@@ -149,7 +149,8 @@ def main():
                 abs_error = (val_predictions[...,:2] - labels[...,:-1]).abs()
                 mae = abs_error.mean(axis=((0,1) if labels.dim()==3 else 0))
 
-                angle_sim = torch.abs(torch.cos(angle_pred - labels[...,-1])).mean().unsqueeze(-1)
+                # cos(alpha)*cos(beta) + sin(alpha)*sin(beta) = cos(alpha - beta) -> [-1, 1]
+                angle_sim = torch.abs(torch.cos(angle_pred - labels[...,-1])).mean().unsqueeze(-1) 
                 errors.append(torch.cat([
                         mae.cpu() * D_max_normalization,
                         angle_sim.cpu()
