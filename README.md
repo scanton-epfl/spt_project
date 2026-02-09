@@ -4,6 +4,8 @@ This repository contains the necessary tools for training and evaluating models 
 - Two-state binding/unbinding
 - Two-state isotropic diffusion
 
+Further information regarding the topic can be found within the final report, `Semester_Project_Fall_2025.pdf`. This README is mainly focused on how to interact with the code within the repository. 
+
 ## Table of Contents
 - [Environment](#)
 - [Training](#training)
