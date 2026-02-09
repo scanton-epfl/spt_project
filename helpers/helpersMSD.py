@@ -3,11 +3,22 @@ import matplotlib.pyplot as plt
 
 """
 Source: https://arxiv.org/pdf/1303.1702 Section 3D -> but we fit line rather than dividing by lag to compute D
+
+File provides helper functions for inferring diffusion tensors using MSD
 """
 
-def compute_covariance_matrix(trajectories):
+def compute_covariance_matrix(trajectories: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
     """
     Computes the covariance matrix / MSD for each time lag
+    
+    Args:
+        trajectories: np.ndarray (N,T,2)
+            Particle trajectories 
+    Returns:
+        C_tensors: np.ndarray (N, T/10, 2, 2)
+            Covariance matrices constructed for N particles and each time lag tau
+        taus: np.ndarray (T/10,)
+            Time lags used
     """
 
     nparticles, num_steps, d = trajectories.shape
@@ -21,14 +32,24 @@ def compute_covariance_matrix(trajectories):
             disp = pos[tao:] - pos[:-tao] # shape (num_steps-tao, d)
 
             # Compute covariance matrix for the particles at this time lag
+            disp = disp - disp.mean(axis=0, keepdims=True)
             C = (disp.T @ disp) / disp.shape[0]
             C_tensors[p,i] = C
 
     return C_tensors, taus
 
-def estimate_diffusion_tensor(C, taus):
+def estimate_diffusion_tensor(C: np.ndarray, taus: np.ndarray) -> np.ndarray:
     """
     Recover diffusion tensor from covariance matrices for time lags tau
+    
+    Args:
+        C: np.ndarray (N, t, 2, 2)
+            Covariance matrices constructed from trajectories and time lags
+        taus: np.ndarray (t,)
+            Time lags used
+    Returns:
+        D_tensors: np.ndarray (N,2,2)
+            Diffusion tensors predicted
     """
     nparticles, _, d, _ = C.shape
     D_tensors = np.zeros((nparticles, d, d))
@@ -42,10 +63,19 @@ def estimate_diffusion_tensor(C, taus):
 
     return D_tensors
 
-def diffusion_tensor_decomposition(D_tensors):
+def diffusion_tensor_decomposition(D_tensors: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
     """
     Performs eigen-decomposition of diffusion tensors to recover principal
     diffusion coefficients and orientations
+    
+    Args:
+        D_tensors: np.ndarray (N,2,2)
+            Diffusion tensors
+    Returns:
+        eigenvalues: np.ndarray (N,2)
+            Eigenvalues from tensors
+        angles: np.ndarray (N,)
+            Angles from tensors
     """
     nparticles = D_tensors.shape[0]
 
@@ -71,7 +101,16 @@ def diffusion_tensor_decomposition(D_tensors):
 
     return eigenvalues, angles
 
-def plotMSD(C, taus):
+def plotMSD(C: np.ndarray, taus: np.ndarray):
+    """
+    Plot MSD-based inference from trajectories
+    
+    Args:
+        C: np.ndarray (N,t,2,2)
+            Covariance matrices
+        taus: np.ndarray (t,)
+            Time lags
+    """
     plt.figure(figsize=(4, 4))
 
     nparticles, nlags, _, _ = C.shape

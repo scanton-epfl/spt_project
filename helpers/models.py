@@ -1,12 +1,23 @@
+"""
+File contains all objects and functions used to build models, including:
+    - Dataset Classes
+    - Attention mechanisms
+    - Transformer Building Blocks
+    - Pytorch Models
+    - Baseline Models
+    - Loss functions
+    - Positional Embeddings (Sinusoidal and Rotary)
+"""
+
 from types import LambdaType
 import numpy as np
 import torch
 import torch.nn as nn
-from torch.utils.data import Dataset, DataLoader
+from torch.utils.data import Dataset
 import torch.nn.functional as F
 import math
 
-MAX_TOKENS = 512
+MAX_TOKENS = 512 # used for positional embeddings
 
 # -----------------------------------------------------------------------------------------
 # Dataset objects for PyTorch implementations
@@ -14,6 +25,12 @@ MAX_TOKENS = 512
 class VideoDataset(Dataset):
     """
     Dataset object for video data
+    
+    Args:
+        videos: torch.Tensor (N, nFrames, H, W)
+            Tensor containing all videos in a dataset
+        labels: torch.Tensor (N,3)
+            Tensor containing the labels for each video where each label contains two diffusion coefficients and an angle theta
     """
     def __init__(self, videos: torch.Tensor, labels: torch.Tensor):
         self.videos = videos
@@ -27,34 +44,25 @@ class VideoDataset(Dataset):
 
 class VideoMotionDataset(VideoDataset):
     """
-    Dataset object for video and relative displacement between frames data
+    Dataset object for video and displacement data
+
+    Args:
+        videos: torch.Tensor (N, nFrames, H, W)
+            Tensor containing all videos in a dataset
+        displacements: torch.Tensor (N, nFrames-1, 2)
+            Tensor containing the displacement between each pair of frames for 2D data
+        labels: torch.Tensor (N,3)
+            Tensor containing the labels for each video where each label contains two diffusion coefficients and an angle theta 
     """
     def __init__(self, videos: torch.Tensor, displacements: torch.Tensor, labels: torch.Tensor):
         super().__init__(videos, labels)
-        # Add zero displacement to front of each sequence in batch to match dimension with image sequences
+        # Add mean displacement to front of each sequence in batch to match dimension with image sequences
         batch_size, _, _ = displacements.shape
-        zeros = torch.zeros(batch_size, 1, 2)
+        zeros = torch.zeros(batch_size, 1, 2) # Normalized displacements so we append zeros
         self.displacements = torch.cat((zeros, displacements), dim=1) # (batch_size, nFrames, 2)
     
     def __getitem__(self, idx: int) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         return self.videos[idx], self.displacements[idx], self.labels[idx]
-
-class DisplacementDataset(Dataset):
-    """
-    Dataset object for displacement data
-    """
-    def __init__(self, displacements: torch.Tensor, labels: torch.Tensor):
-        super().__init__()
-        batch_size, _, _ = displacements.shape
-        zeros = torch.zeros(batch_size, 1, 2)
-        self.displacements = torch.cat((zeros,displacements), dim=1)
-        self.labels = labels
-    
-    def __len__(self) -> int:
-        return len(self.labels)
-
-    def __getitem__(self, idx: int) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        return self.displacements[idx], torch.Tensor(), self.labels[idx]
 
 # -----------------------------------------------------------------------------------------
 # Attention mechanisms
@@ -62,8 +70,18 @@ class DisplacementDataset(Dataset):
 class MultiheadAttention(nn.Module):
     """
     Object for representing multi-head attention
+    
+    Args:
+        embed_dim: int
+            Dimension of our inputs to the attention mechanism
+        num_heads: int
+            Number of heads for multi-head attention
+        dropout: float
+            Dropout for regularization
+        use_rotary: bool
+            Signifies whether rotary embeddings should be used for encoding positional relationships
     """
-    def __init__(self, embed_dim: int, num_heads: int, dropout: float=0.0, use_rotary=False):
+    def __init__(self, embed_dim: int, num_heads: int, dropout: float=0.0, use_rotary: bool=False):
         super().__init__()
         self.embed_dim = embed_dim
         self.num_heads = num_heads
@@ -83,9 +101,16 @@ class MultiheadAttention(nn.Module):
         if use_rotary:
             self.rope = Rotary(self.head_dim)
 
-    def forward(self, x: torch.Tensor):
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
         """
         Forward pass through self-attention mechanism
+        
+        Args:
+            x: torch.Tensor (batch_size, num_tokens, embed_dim)
+                Encoded data sequence
+        Returns:
+            output: torch.Tensor (batch_size, num_tokens, embed_dim)
+                Encoded data after passing through multi-head attention
         """
         batch_size = x.shape[0]
 
@@ -113,8 +138,18 @@ class MultiheadAttention(nn.Module):
 class CrossAttention(nn.Module):
     """
     Object for representing cross attention
+    
+    Args:
+        embed_dim: int
+            Dimension of our inputs to the attention mechanism
+        num_heads: int
+            Number of heads for multi-head attention
+        dropout: float
+            Dropout for regularization
+        use_rotary: bool
+            Signifies whether rotary embeddings should be used for encoding positional relationships
     """
-    def __init__(self, embed_dim: int, num_heads: int, dropout: float=0.0, use_rotary=False):
+    def __init__(self, embed_dim: int, num_heads: int, dropout: float=0.0, use_rotary: bool=False):
         super().__init__()
         self.embed_dim = embed_dim
         self.num_heads = num_heads
@@ -142,6 +177,17 @@ class CrossAttention(nn.Module):
     def forward(self, tokens_a: torch.Tensor, tokens_b: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
         """
         Forward pass through cross attention module
+        
+        Args:
+            tokens_a: torch.Tensor (batch_size, num_tokens, embed_dim)
+                Encoded images
+            tokens_b: torch.Tensor (batch_size, num_tokens, embed_dim)
+                Encoded displacements
+        Returns:
+            output_a: torch.Tensor
+                Encoded images after being passed through cross attention
+            output_b: torch.Tensor
+                Encoded displacements after being passed through cross attention
         """
         batch_size = tokens_a.shape[0]
 
@@ -179,17 +225,32 @@ class CrossAttention(nn.Module):
 class FeedForward(nn.Module):
     """
     Object for representing a feed forward network in a transformer block
+    
+    Args:
+        embed_dim: int
+            Dimension of the output of the attention mechanism
+        hidden_dim: int
+            Hidden dimension within the FFN
+        dropout: float
+            Dropout for regularization
     """
-    def __init__(self, embed_dim: int, hidden_dim: int, dropout=0.0):
+    def __init__(self, embed_dim: int, hidden_dim: int, dropout: float=0.0):
         super().__init__()
         self.fc1 = nn.Linear(embed_dim, hidden_dim)
         self.fc2 = nn.Linear(hidden_dim, embed_dim)
         self.dropout = nn.Dropout(dropout)
         self.activation = nn.ReLU()
     
-    def forward(self, x: torch.Tensor):
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
         """
-        Forward pass through MLP
+        Forward pass through FFN
+        
+        Args:
+            x: torch.Tensor (batch_size, num_tokens, embed_dim)
+                Encoded sequence to pass through FFN
+        Returns:
+            x: torch.Tensor (batch_size, num_tokens, embed_dim)
+                Sequence after being passed through the FFN
         """
         x = self.fc1(x)
         x = self.activation(x)
@@ -200,6 +261,18 @@ class FeedForward(nn.Module):
 class TransformerBlock(nn.Module):
     """
     Object for representing a transformer block
+    
+    Args:
+        embed_dim: int
+            Dimension of input data
+        num_heads: int
+            Number of heads within the attention mechanism
+        hidden_dim: int
+            Dimension within FFN
+        dropout: float
+            Dropout for regularization
+        use_rotary: bool
+            Specifies whether to use Rotary positional embeddings
     """
     def __init__(self, embed_dim: int, num_heads: int, hidden_dim: int, dropout: float=0.0, use_rotary: bool=False):
         super().__init__()
@@ -217,13 +290,16 @@ class TransformerBlock(nn.Module):
         # Dropout
         self.dropout = nn.Dropout(dropout)
 
-    def forward(self, x: torch.Tensor):
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
         """
         Forward pass through a transformer block
 
         Args:
             x: torch.Tensor (batch_size, num_tokens, embed_dim)
                 Batch of sequences for input to the transformer
+        Returns:
+            x: torch.Tensor (batch_size, num_tokens, embed_dim)
+                Batch of sequences after being passed through one transformer block
         """
         # Attention and skip connection 
         attn_output = self.self_attn(x)
@@ -240,6 +316,18 @@ class TransformerBlock(nn.Module):
 class CrossTransformerBlock(nn.Module):
     """
     Object representing a transformer block in a cross attention based model
+    
+    Args:
+        embed_dim: int
+            Dimension of input data
+        num_heads: int
+            Number of heads within the attention mechanism
+        hidden_dim: int
+            Dimension within FFN
+        dropout: float
+            Dropout for regularization
+        use_rotary: bool
+            Specifies whether to use Rotary positional embeddings
     """
     def __init__(self, embed_dim: int, num_heads: int, hidden_dim: int, dropout: float=0.0, use_rotary: bool=False):
         super().__init__()
@@ -263,8 +351,17 @@ class CrossTransformerBlock(nn.Module):
     def forward(self, tokens_a: torch.Tensor, tokens_b: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
         """
         Forward pass through a transformer block with cross attention
+        
+        Args:
+            tokens_a: torch.Tensor (batch_size, num_tokens, embed_dim)
+                Encoded images
+            tokens_b: torch.Tensor (batch_size, num_tokens, embed_dim)
+                Encoded displacements    
+        Returns:
+            tokens_a, tokens_b: torch.Tensor (batch_size, num_tokens, embed_dim)
+                Each seqence after being passed through the cross transformer block
         """
-        # Attention
+        # Cross attention
         output_a, output_b = self.cross_attn(tokens_a, tokens_b)
         
         # Skip connection and norm
@@ -275,25 +372,22 @@ class CrossTransformerBlock(nn.Module):
         tokens_a = self.apply_subblock(tokens_a, self.mlp_a, self.norm2_a)
         tokens_b = self.apply_subblock(tokens_b, self.mlp_b, self.norm2_b)
 
-        # # Pre-norm cross-attention
-        # a_attn, b_attn = self.cross_attn(
-        #     self.norm1_a(tokens_a),
-        #     self.norm1_b(tokens_b)
-        # )
-
-        # tokens_a = tokens_a + self.dropout(a_attn)
-        # tokens_b = tokens_b + self.dropout(b_attn)
-
-        # # Pre-norm feedforward
-        # tokens_a = tokens_a + self.dropout(self.mlp_a(self.norm2_a(tokens_a)))
-        # tokens_b = tokens_b + self.dropout(self.mlp_b(self.norm2_b(tokens_b)))
-
-
         return tokens_a, tokens_b
     
     def apply_subblock(self, x: torch.Tensor, sublayer: LambdaType, norm: LambdaType):
         """
         Helper function to apply a sublayer within a transformer block
+        
+        Args:
+            x: torch.Tensor (batch_size, num_tokens, embed_dim)
+                Encoded sequence before attention
+            sublayer: LambdaType
+                Function to apply to x
+            norm: LambdaType
+                LayerNorm to apply
+        Returns:
+            x: torch.Tensor (batch_size, num_tokens, embed_dim)
+                Batch of sequences after passing through 
         """
         x = x + self.dropout(sublayer(x))
         
@@ -302,6 +396,22 @@ class CrossTransformerBlock(nn.Module):
 class Transformer(nn.Module):
     """
     Object for representing a transformer encoder
+    
+    Args:
+        embed_dim: int
+            Dimension of input data
+        num_heads: int
+            Number of heads within the attention mechanism
+        hidden_dim: int
+            Dimension within FFN
+        num_layers: int
+            Number of transformer layers to implement
+        dropout: float
+            Dropout for regularization
+        use_pos_encoding: bool
+            Specifies whether to use sinusoidal positional embeddings
+        use_rotary: bool
+            Specifies whether to use Rotary positional embeddings
     """
     def __init__(self, embed_dim: int, num_heads: int, hidden_dim: int, num_layers: int, dropout: float, use_pos_encoding: bool=False, use_rotary: bool=False):
         super().__init__()
@@ -340,6 +450,24 @@ class Transformer(nn.Module):
 class CrossTransformer(nn.Module):
     """
     Object representing a cross attention based transformer
+    
+    Args:
+        embed_dim: int
+            Dimension of input data
+        num_heads: int
+            Number of heads within the attention mechanism
+        hidden_dim: int
+            Dimension within FFN
+        num_layers: int
+            Number of transformer layers to implement
+        dropout: float
+            Dropout for regularization
+        use_pos_encoding: bool
+            Specifies whether to use sinusoidal positional embeddings
+        use_segment_embed: bool
+            Specifies whether to use segment embeddings for differentiating between each modality
+        use_rotary: bool
+            Specifies whether to use Rotary positional embeddings
     """
     def __init__(self, embed_dim: int, num_heads: int, hidden_dim: int, num_layers: int, dropout: float, use_pos_encoding: bool=False, use_segment_embed: bool=False, use_rotary: bool=False):
         super().__init__()
@@ -371,6 +499,15 @@ class CrossTransformer(nn.Module):
     def get_embeddings(self, x: torch.Tensor, segment_id: int=0):
         """
         Apply positional and segment embeddings
+        
+        Args:
+            x: torch.Tensor (batch_size, num_tokens, embed_dim)
+                Encoded sequences
+            segment_id: int
+                Specify which modality is being encoded, 0 for images and 1 for displacements
+        Returns:
+            x: torch.Tensor (batch_size, num_tokens, embed_dim)
+                Encoded sequences with additional embeddings if requested
         """
         batch_size, seq_len, _ = x.shape
 
@@ -386,6 +523,15 @@ class CrossTransformer(nn.Module):
     def forward(self, tokens_a: torch.Tensor, tokens_b: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
         """
         Forward pass through cross attention transformer
+        
+        Args:
+            tokens_a: torch.Tensor (batch_size, num_tokens, embed_dim)
+                Image tokens
+            tokens_b: torch.Tensor (batch_size, num_tokens, embed_dim)
+                Displacement tokens
+        Returns:
+            tokens_a, tokens_b: torch.Tensor (batch_size, num_tokens, embed_dim)
+                Sequences from each modality after being passed through the cross transformer
         """
         tokens_a = self.get_embeddings(tokens_a, segment_id=0)
         tokens_b = self.get_embeddings(tokens_b, segment_id=1)
@@ -398,6 +544,16 @@ class CrossTransformer(nn.Module):
 class RegressionHead(nn.Module):
     """
     Object representing the MLP head for prediction of the diffusion parameters
+    
+    Args:
+        input_dim: int
+            Embedding dimension of input to MLP head
+        hidden_dim: int
+            Hidden dimension of MLP layers
+        dropout: float
+            Dropout for regularization
+        output_dim: int
+            Number of outputs
     """
     def __init__(self, input_dim: int, hidden_dim: int=128, dropout: float=0.0, output_dim: int=4):
         super().__init__()
@@ -408,17 +564,30 @@ class RegressionHead(nn.Module):
             nn.Linear(hidden_dim, output_dim)
         )
     
-    def forward(self, x: torch.Tensor):
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
         """
         Forward pass through prediction head on transformer output
+        
+        Args:
+            x: torch.Tensor (batch_size, nFrames or 1, input_dim)
+        Returns:
+            Output of MLP for prediction
         """
         return self.mlp(x)
     
 class ResidualBlock(nn.Module):
     """
     Object representing a residual block in a ResNet
+    
+    Args:
+        in_channels: int
+            Number of input channels to convolution
+        out_channels: int
+            Number of output channels of convolution
+        downsample: bool
+            Specifies whether to downsample to reduce spatial dimensions
     """
-    def __init__(self, in_channels, out_channels, downsample=False):
+    def __init__(self, in_channels: int, out_channels: int, downsample: bool=False):
         super().__init__()
         # Set stride if reducing dimensionality
         stride = 2 if downsample else 1
@@ -440,9 +609,15 @@ class ResidualBlock(nn.Module):
                 nn.BatchNorm2d(out_channels)
                 )
             
-    def forward(self, x):
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
         """
         Pass through residual block
+        
+        Args:
+            x: torch.Tensor (batch_size*nFrames, ...)
+                Flattened batches of videos
+        Returns:
+            Output of residual block within ResNet model
         """
         # First layer
         out = self.conv1(x)
@@ -458,8 +633,12 @@ class ResidualBlock(nn.Module):
 class DeepResNetEmbedding(nn.Module):
     """
     Object representing a ResNet for embedding image data
+    
+    Args:
+        embed_dim: int
+            Emebdding dimension for output of ResNet
     """
-    def __init__(self, embed_dim=128):
+    def __init__(self, embed_dim: int=128):
         super().__init__()
         self.initial_conv = nn.Conv2d(1, 32, kernel_size=3, padding=1, bias=False)
         self.bn1 = nn.BatchNorm2d(32)
@@ -471,9 +650,16 @@ class DeepResNetEmbedding(nn.Module):
         self.global_pool = nn.AdaptiveAvgPool2d((1, 1))  # Global pooling to reduce spatial dims
         self.fc = nn.Linear(128, embed_dim)  # Project to embed_dim
 
-    def forward(self, x):
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
         """
         Forward pass through ResNet embedder
+        
+        Args:
+            x: torch.Tensor (batch_size, num_tokens, H, W)
+                Batch of image sequences input to model
+        Returns:
+            torch.Tensor (batch_size, num_tokens, embed_dim)
+                Encoded input
         """
         batch_size, num_images, h, w = x.shape
         x = x.reshape(batch_size * num_images, 1, h, w)  # Flatten num_images into batch
@@ -493,6 +679,18 @@ class DeepResNetEmbedding(nn.Module):
 class MLP(nn.Module):
     """
     General MLP
+    
+    Args:
+        input_dim: int
+            Embedding dimension of input
+        hidden_dim: int
+            Hidden embedding dimension within hidden layers of MLP
+        num_layers: int
+            Number of layers in MLP
+        output_dim: int
+            Embedding dimension of output
+        dropout: float
+            Dropout for regularization
     """
     def __init__(self, input_dim: int=2, hidden_dim: int=128, num_layers: int=2, output_dim: int=32, dropout: float=0.0):
         super().__init__()
@@ -528,6 +726,20 @@ class MLP(nn.Module):
 class DiffusionTensorRegModelBase(nn.Module):
     """
     Object representing the model for predicting the diffusion tensor
+    
+    Args:
+        embed_dim: int
+            Dimension of input data
+        num_heads: int
+            Number of heads within the attention mechanism
+        hidden_dim: int
+            Hidden dimension within MLPs
+        num_layers: int
+            Number of transformer layers to implement
+        dropout: float
+            Dropout for regularization
+        use_pos_encoding: bool
+            Specifies whether to use sinusoidal positional embeddings
     """
     def __init__(self, embed_dim: int, num_heads: int, hidden_dim: int, num_layers: int, dropout: float, use_pos_encoding: bool=False):
         super().__init__()
@@ -545,9 +757,15 @@ class DiffusionTensorRegModelBase(nn.Module):
         # Instantiate regression head
         self.mlp = RegressionHead(embed_dim, hidden_dim, dropout=dropout)
 
-    def forward(self, x: torch.Tensor):
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
         """
         Forward pass through the base model
+        
+        Args:
+            x: torch.Tensor (batch_size, num_frames, H, W)
+                Batch of image sequences
+        Returns:
+            Predictions for each image sequence (batch_size, 4)
         """
         # Get encoded videos
         encoded = self.image_encoder(x) # (batch_size, num_frames, embed_dim)
@@ -572,6 +790,12 @@ class DiffusionTensorRegModelBase(nn.Module):
 class DiffusionTensorRegModel(DiffusionTensorRegModelBase):
     """
     Object representing the model for predicting the diffusion tensor w/ displacement data as a second mode
+    
+    Args:
+        use_sum: bool
+            Specifies whether to combine modalities with a simple sum of encodings
+        use_rotary: bool
+            Specifies whether to use rotary postional embeddings
     """
     def __init__(self, embed_dim: int, num_heads: int, hidden_dim: int, num_layers: int, 
                  dropout: float, use_pos_encoding: bool=False, use_sum: bool=False, use_rotary: bool=False):
@@ -592,9 +816,17 @@ class DiffusionTensorRegModel(DiffusionTensorRegModelBase):
         # Instantiate regression head
         self.mlp = RegressionHead(embed_dim, hidden_dim, dropout=dropout)
 
-    def forward(self, x: torch.Tensor, disp: torch.Tensor):
+    def forward(self, x: torch.Tensor, disp: torch.Tensor) -> torch.Tensor:
         """
         Forward pass through summation/concatentation multimodal model
+        
+        Args:
+            x: torch.Tensor (batch_size, num_frames, H, W)
+                Batch of videos
+            disp: torch.Tensor (batch_size, num_frames, 2)
+                Batch of displacements between frames
+        Returns:
+            Predictions for each pair of sequences in batch (batch_size, 4)
         """
         # Get encoded videos
         encoded_images = self.image_encoder(x) # (batch_size, num_frames, embed_dim)
@@ -627,7 +859,22 @@ class DiffusionTensorRegModel(DiffusionTensorRegModelBase):
 
 class DisplacementBasedModel(nn.Module):
     """
+    CAN IGNORE THIS MODEL IF YOU WANT OR REMOVE
     Object representing a model that only uses encoded displacement features
+    
+    Args:
+        embed_dim: int
+            Dimension of input data
+        num_heads: int
+            Number of heads within the attention mechanism
+        hidden_dim: int
+            Hidden dimension within MLPs
+        num_layers: int
+            Number of transformer layers to implement
+        dropout: float
+            Dropout for regularization
+        use_pos_encoding: bool
+            Specifies whether to use sinusoidal positional embeddings
     """
     def __init__(self, embed_dim: int, num_heads: int, hidden_dim: int, num_layers: int, dropout: float, use_pos_encoding: bool=False):
         super().__init__()
@@ -647,8 +894,12 @@ class DisplacementBasedModel(nn.Module):
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         """
         Forward pass through the base model
+        
+        Args:
+            x: torch.Tensor (batch_size, num_frames, 2)
+        Returns:
+            Predictions for each sequence in batch (batch_size, 4)
         """
-
         # Encode displacement data
         encoded = self.disp_encoder(x)
 
@@ -668,7 +919,22 @@ class DisplacementBasedModel(nn.Module):
 
 class HierarchicalModel(nn.Module):
     """
+    NOT CURRENTLY USED, CAN BE UPDATED OR REMOVED
     Object representing a hierarchical model (one to multi stream)
+    
+    Args:
+        embed_dim: int
+            Dimension of input data
+        num_heads: int
+            Number of heads within the attention mechanism
+        hidden_dim: int
+            Hidden dimension within MLPs
+        num_layers: int
+            Number of transformer layers to implement
+        dropout: float
+            Dropout for regularization
+        use_pos_encoding: bool
+            Specifies whether to use sinusoidal positional embeddings
     """
     def __init__(self, embed_dim: int, num_heads: int, hidden_dim: int, num_layers: int, dropout: float, use_pos_encoding: bool=False):
         super().__init__()
@@ -698,6 +964,14 @@ class HierarchicalModel(nn.Module):
     def forward(self, x: torch.Tensor, disp: torch.Tensor) -> torch.Tensor:
         """
         Forward pass through hierarchical model
+        
+        Args:
+            x: torch.Tensor (batch_size, num_frames, H, W)
+                Batch of videos
+            disp: torch.Tensor (batch_size, num_frames, 2)
+                Batch of displacements between frames
+        Returns:
+            Predictions for each pair of sequences in batch (batch_size, 4)
         """
         # Encode images
         encoded_images = self.image_encoder(x)
@@ -742,6 +1016,26 @@ class HierarchicalModel(nn.Module):
 class CrossAttentionModelBase(nn.Module):
     """
     Object representing a model based on cross attention between two modalities
+
+    Args:
+        embed_dim: int
+            Dimension of input data
+        num_heads: int
+            Number of heads within the attention mechanism
+        hidden_dim: int
+            Hidden dimension within MLPs
+        num_layers: int
+            Number of transformer layers to implement
+        dropout: float
+            Dropout for regularization
+        output_dim: int
+            Number of outputs for each prediction
+        use_pos_embed: bool
+            Specifies whether to use sinusoidal positional embeddings
+        use_segment_embed: bool
+            Specifies whether to use segment embeddings or not
+        use_rotary: bool
+            Specifies whether to use rotary embeddings for position-aware encodings
     """
     def __init__(self, embed_dim: int, num_heads: int, hidden_dim: int, num_layers: int, dropout: float, output_dim: int=4, use_pos_embed: bool=False, use_segment_embed: bool=False, use_rotary: bool=False):
         super().__init__()
@@ -766,6 +1060,15 @@ class CrossAttentionModelBase(nn.Module):
     def get_cross_transformer_out(self, x: torch.Tensor, disp: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
         """
         Helper function for abstraction
+        
+        Args:
+            x: torch.Tensor (batch_size, num_frames, H, W)
+                Batch of image sequences
+            disp: torch.Tensor (batch_size, num_frames, 2)
+                Batch of displacements per video
+        Returns:
+            image_out, disp_out: torch.Tensor (batch_size, num_frames, embed_dim)
+                Each modalities batch of outputs from the cross transformer
         """
         # Encode displacements and images
         encoded_images = self.image_encoder(x)
@@ -788,6 +1091,15 @@ class CrossAttentionModelBase(nn.Module):
     def forward(self, x: torch.Tensor, disp: torch.Tensor):
         """
         Forward pass through cross attention model
+    
+        Args:
+            x: torch.Tensor (batch_size, num_frames, H, W)
+                Batch of image sequences
+            disp: torch.Tensor (batch_size, num_frames, 2)
+                Batch of displacements per video
+        Returns:
+            predictions: torch.Tensor (batch_size, 4)
+                Predictions for each input sequence
         """
         # Get output sequences from cross transformer
         image_out, disp_out = self.get_cross_transformer_out(x, disp)
@@ -802,7 +1114,10 @@ class CrossAttentionModelBase(nn.Module):
     
 class CrossAttentionModel(CrossAttentionModelBase):
     """
-    Object representing a model that uses cross attention and self attention across two layers
+    Object representing a model that uses cross attention to concatentation architecture (MAIN ARCHITECTURE FOR THIS WORK)
+    
+    Args:
+        Same arguments as parent classes
     """
     def __init__(self, embed_dim: int, num_heads: int, hidden_dim: int, num_layers: int, dropout: float, output_dim: int=4, use_pos_embed: bool=False, use_segment_embed: bool=False, use_rotary: bool=False):
         super().__init__(embed_dim, num_heads, hidden_dim, num_layers, dropout, output_dim, use_pos_embed, use_segment_embed, use_rotary)
@@ -813,6 +1128,15 @@ class CrossAttentionModel(CrossAttentionModelBase):
     def forward(self, x: torch.Tensor, disp: torch.Tensor) -> torch.Tensor:
         """
         Forward pass through cross transformer and a transformer on top of it
+        
+        Args:
+            x: torch.Tensor (batch_size, num_frames, H, W)
+                Batch of image sequences
+            disp: torch.Tensor (batch_size, num_frames, 2)
+                Batch of displacements per video
+        Returns:
+            predictions: torch.Tensor (batch_size, 4)
+                Predictions for each input sequence
         """
         # Cross transformer output
         image_out, disp_out = self.get_cross_transformer_out(x, disp)
@@ -834,6 +1158,26 @@ class CrossAttentionModel(CrossAttentionModelBase):
 class MultiStateModel(nn.Module):
     """
     Object representing a cross transformer based model for multi-state diffusion prediction
+    
+    Args:
+        embed_dim: int
+            Dimension of input data
+        num_heads: int
+            Number of heads within the attention mechanism
+        hidden_dim: int
+            Hidden dimension within MLPs
+        num_layers: int
+            Number of transformer layers to implement
+        dropout: float
+            Dropout for regularization
+        output_dim: int
+            Number of outputs for each prediction
+        use_pos_embed: bool
+            Specifies whether to use sinusoidal positional embeddings
+        use_segment_embed: bool
+            Specifies whether to use segment embeddings or not
+        use_rotary: bool
+            Specifies whether to use rotary embeddings for position-aware encodings
     """
     def __init__(self, embed_dim: int, num_heads: int, hidden_dim: int, num_layers: int, dropout: float, output_dim: int=4, use_pos_embed: bool=False, use_segment_embed: bool=False, use_rotary: bool=False):
         super().__init__()
@@ -851,14 +1195,23 @@ class MultiStateModel(nn.Module):
         # Instantiate regression head
         self.mlp = RegressionHead(embed_dim*2, hidden_dim, dropout=dropout, output_dim=output_dim)
 
-    def forward(self, tokens_a: torch.Tensor, tokens_b: torch.Tensor) -> torch.Tensor:
+    def forward(self, x: torch.Tensor, disp: torch.Tensor) -> torch.Tensor:
         """
         Forward pass through model
+        
+        Args:
+            x: torch.Tensor (batch_size, num_frames, H, W)
+                Batch of image sequences
+            disp: torch.Tensor (batch_size, num_frames, 2)
+                Batch of displacements per video
+        Returns:
+            predictions: torch.Tensor (batch_size, num_frames, 4)
+                Frame-wise predictions for each video in the batch
         """
         # Encode images and displacements
-        encoded_images = self.image_encoder(tokens_a)
+        encoded_images = self.image_encoder(x)
         encoded_images = self.norm(encoded_images)
-        encoded_disp = self.disp_encoder(tokens_b)
+        encoded_disp = self.disp_encoder(disp)
 
         # Pass context to transformer
         image_out, disp_out = self.cross_transformer(encoded_images, encoded_disp)
@@ -885,6 +1238,24 @@ class MultiStateModel(nn.Module):
 class LSTM(nn.Module):
     """
     Object representing a LSTM model for comparison to transformer implementation
+    
+    Note: A better implementation likely exists for making pointwise predictions (e.g. bidirectional version wasn't attempted for pointwise which will likely be better than the baseline unidirectional model used)
+    
+    Args:
+        embed_dim: int
+            Dimension of input data
+        hidden_dim: int
+            Hidden dimension inside LSTM and MLP
+        num_layers: int
+            Number of LSTM layers to implement
+        output_dim: int
+            Number of outputs for each prediction
+        bidirectional: bool
+            Whether to implement a bidirectional LSTM or not
+        dropout: float
+            Dropout for regularization
+        pointwise: bool
+            Specifies whether to make frame-wise predictions
     """
     def __init__(self, embed_dim: int, hidden_dim: int, num_layers: int, output_dim: int=4, bidirectional: bool=False, dropout: float=0, pointwise: bool=False):
         super().__init__()
@@ -894,9 +1265,15 @@ class LSTM(nn.Module):
         self.lstm = nn.LSTM(embed_dim, hidden_dim, num_layers, batch_first=True, bidirectional=bidirectional, dropout=dropout)
         self.fc = RegressionHead(hidden_dim, hidden_dim, dropout, output_dim)
 
-    def forward(self, x):
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
         """
         Forward pass through LSTM-based model
+        
+        Args:
+            x: torch.Tensor (batch_size, num_frames, H, W)
+                Batch of videos
+        Returns:
+            out: torch.Tensor (batch_size, num_Frames or 1, output_dim)
         """
         # Extract CNN features for each frame
         frame_features = self.image_encoder(x)
@@ -922,8 +1299,18 @@ class LSTM(nn.Module):
 class Pix2D(nn.Module):
     """
     Object representing the model used in the Pix2D paper https://github.com/ha-park/Pix2D-NN-diffusivity-mapping
+    
+    Note: This is a poor implementation for pointwise predictions and should be adjusted to make a better baseline
+    
+    Args:
+        n_channels: int
+            Base number of channels within convolutions
+        output_dim: int
+            Number of outputs for each prediction
+        pointwise: bool
+            Specifies whether to make frame-wise predictions
     """
-    def __init__(self, n_channel=16, output_dim=4, pointwise=False):
+    def __init__(self, n_channel: int=16, output_dim: int=4, pointwise: bool=False):
         super().__init__()
 
         # Whether the model should make predictions per-frame or not
@@ -971,7 +1358,16 @@ class Pix2D(nn.Module):
         # Fully connected regression layer
         self.fc = nn.Linear(n_channel*8, output_dim)
     
-    def forward(self, x):
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """
+        Forward pass through Pix2D
+        
+        Args:
+            x: torch.Tensor (batch_size, num_frames, H, W)
+                Batch of videos
+        Returns:
+            Sequence-wise or frame-wise predictions (batch_size, output_dim) or (batch_size, num_frames, output_dim)
+        """
         batch_size, num_images, h, w = x.shape
         x = x.reshape(batch_size * num_images, 1, h, w)  # Flatten num_images into batch
 
@@ -1056,7 +1452,7 @@ def log_euclidean_distance(predictions: torch.Tensor, labels: torch.Tensor) -> t
 
 def log_euclidean_loss(predictions: torch.Tensor, labels: torch.Tensor) -> torch.Tensor:
     """
-    Log-Euclidean loss function
+    Log-Euclidean loss function (NOT USED ANYMORE)
 
     Args:
         predictions: torch.Tensor (batch_size, 4) or (batch_size, nFrames, 4)
@@ -1117,7 +1513,7 @@ def mse_loss_coeff(predictions: torch.Tensor, labels: torch.Tensor) -> torch.Ten
     """
     MSE loss function for purely diffusion coefficient predictions
     Args:
-        predictions: torch.Tensor (batch_size, 4) or (batch_size, nFrames, 4)
+        predictions: torch.Tensor (batch_size, 2) or (batch_size, nFrames, 2)
         labels: torch.Tensor (batch_size, 3) or (batch_size, nFrames, 3)
     Returns:
         loss: torch.Tensor (1,)
@@ -1125,25 +1521,7 @@ def mse_loss_coeff(predictions: torch.Tensor, labels: torch.Tensor) -> torch.Ten
     """
     return torch.mean((predictions - labels[..., :-1])**2)
 
-def mse_similarity(predictions: torch.Tensor, labels: torch.Tensor):
-    """
-    Compute similarity of two diffusion tensors based on Euclidean distance and RBF kernel
-    """
-    # Compute diffusion tensors
-    theta_pred = 0.5 * torch.atan2(predictions[..., -2], predictions[..., -1])
-    m1 = construct_matrix(predictions[..., 0], predictions[..., 1], theta_pred)
-    m2 = construct_matrix(labels[..., 0], labels[..., 1], labels[..., -1])
-
-    # Compute Frobenius norm
-    d = torch.linalg.norm(m1 - m2, dim=(-2,-1))
-
-    # Convert distance to a similarity
-    gamma = 1
-    similarity = torch.mean(torch.exp(-gamma * d ** 2))
-
-    return similarity 
-
-def get_changepoints(x: np.ndarray):
+def get_changepoints(x: np.ndarray) -> np.ndarray:
     """
     In a two-state scenario, find where the changepoint is located. Goal is to minimize the variance of each side according to the split index
     
@@ -1165,7 +1543,7 @@ def get_changepoints(x: np.ndarray):
     
     return np.argmin(cost, axis=1)
 
-def compute_changepoint_error(pred: np.ndarray, labels: np.ndarray):
+def compute_changepoint_error(pred: np.ndarray, labels: np.ndarray) -> float:
     """
     Compute the error between predictions and labels changepoint values
     
@@ -1176,7 +1554,7 @@ def compute_changepoint_error(pred: np.ndarray, labels: np.ndarray):
             Multistate model labels
     
     Returns:
-        loss:
+        loss: np.float
             Average error between prediction and label
     """
     changepoints_pred = get_changepoints(pred[..., :2])
@@ -1188,7 +1566,16 @@ def compute_changepoint_error(pred: np.ndarray, labels: np.ndarray):
 # Positional embeddings helpers
 
 class SinusoidalPositionEmbedding(nn.Module):
-    def __init__(self, embed_dim, max_len=MAX_TOKENS):
+    """
+    Object for sinusoidal embeddings
+    
+    Args:
+        embed_dim: int
+            Embedding dimension
+        max_len: int
+            Max number of tokens in a sequence
+    """
+    def __init__(self, embed_dim: int, max_len: int=MAX_TOKENS):
         super().__init__()
         # Create a (max_len, embed_dim) matrix
         position = torch.arange(0, max_len, dtype=torch.float).unsqueeze(1)  # [max_len, 1]
@@ -1201,7 +1588,7 @@ class SinusoidalPositionEmbedding(nn.Module):
 
         self.register_buffer('pe', pe)
 
-    def forward(self, x):
+    def forward(self, x: torch.Tensor):
         """
         Args:
             x: Tensor of shape [batch_size, seq_len, embed_dim]
@@ -1214,8 +1601,14 @@ class SinusoidalPositionEmbedding(nn.Module):
 class Rotary(torch.nn.Module):
     """
     Object for representing a cached rotary matrix for computing RoPE embeddings
+
+    Args:
+        dim: int
+            Dimension of data passed to each attention head
+        base: int
+            Base for computing inverse frequencies
     """
-    def __init__(self, dim, base=10000):
+    def __init__(self, dim: int, base: int=10000):
         super().__init__()
         inv_freq = 1.0 / (base ** (torch.arange(0, dim, 2).float() / dim))
         self.register_buffer("inv_freq", inv_freq)
@@ -1223,7 +1616,10 @@ class Rotary(torch.nn.Module):
         self.cos_cached = None
         self.sin_cached = None
 
-    def forward(self, x, seq_dim=2):
+    def forward(self, x: torch.Tensor, seq_dim: int=2):
+        """
+        Forward pass to create cached frequencies / return cached frequencies
+        """
         seq_len = x.shape[seq_dim]
         if seq_len != self.seq_len_cached:
             self.seq_len_cached = seq_len
@@ -1235,7 +1631,7 @@ class Rotary(torch.nn.Module):
 
         return self.cos_cached, self.sin_cached
 
-def rotate_half(x):
+def rotate_half(x: torch.Tensor):
     """
     Rotates half the hidden dims of the input
     """
@@ -1243,9 +1639,23 @@ def rotate_half(x):
     x2 = x[..., x.shape[-1] // 2 :]
     return torch.cat((-x2, x1), dim=-1)  
 
-def apply_rotary_pos_emb(q, k, cos, sin):
+def apply_rotary_pos_emb(q: torch.Tensor, k: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor):
     """
     Apply RoPE embedding
+    
+    Args:
+        q: torch.Tensor
+            Query tokens from attention
+        k: torch.Tensor
+            Key tokens from attention
+        cos: torch.Tensor 
+            Cached cos frequencies
+        sin: torch.Tensor
+            Cached sin frequencies
+    
+    Returns:
+        q_embed, k_embed: torch.Tensor
+            Tokens within attention with applied RoPE embeddings
     """
     q_embed = (q * cos) + (rotate_half(q) * sin)
     k_embed = (k * cos) + (rotate_half(k) * sin)

@@ -1,4 +1,7 @@
-from os import replace
+"""
+File contains all functions for simulations
+"""
+
 import numpy as np
 from skimage.measure import block_reduce
 import matplotlib as plt
@@ -6,7 +9,26 @@ import matplotlib.animation as animation
 import matplotlib.pyplot as plt
 from IPython.display import HTML, display
 
-def generate_diffusion_props(N, D_min, D_max, angle_max, is_isotropic=False, is_binding=False) -> np.ndarray:
+def generate_diffusion_props(N: int, D_min: int | float, D_max: int | float, angle_max: float, is_isotropic: bool=False, is_binding: bool=False) -> np.ndarray:
+    """
+    Generate random diffusion properties. Diffusion coefficients should be in micrometers squared per second. 
+    
+    Args:
+        N: int
+            Number of elements to sample
+        D_min: int | float
+            Minimum diffusion coefficient. Function expects an integer unless is_binding=True
+        D_max: int | float
+            Maximum diffusion coefficient. Function expects an integer unless is_binding=True
+        angle_max: float
+            Maximum angle in rad
+        is_isotropic: bool
+            Specifies whether to generate isotropic properties
+        is_binding: bool
+            Specifies whether to generate values for a bound state
+    Returns:
+        Stacked properties (N, 3)
+    """
     # Generate random diffusion parameters
     if is_binding:
         p1 = np.random.uniform(D_min, D_max, size=N)
@@ -26,12 +48,21 @@ def generate_diffusion_props(N, D_min, D_max, angle_max, is_isotropic=False, is_
 
     return np.stack((p1, p2, theta), axis=-1)
 
-def compute_displacement_statistics(displacements: np.ndarray) -> tuple:
+def compute_displacement_statistics(displacements: np.ndarray) -> tuple[np.float64, np.float64, np.float64, np.float64]:
     """
     Compute training set displacement statistics for normalization
 
     Args:
-        displacements: (N, nFrames, 2)
+        displacements: np.ndarray (N, nFrames-1, 2)
+    Returns:
+        dx_mean: np.float64
+            Mean displacement along x-axis
+        dy_mean: np.float64
+            Mean displacement along y-axis
+        dx_std: np.float64
+            Standard deviation of displacements in x-direction
+        dy_std: np.float64
+            Standard deviation of displacements in y-direction
     """
     dx_mean, dy_mean = displacements.mean(axis=(0,1))
     dx_std, dy_std = displacements.std(axis=(0,1))
@@ -41,6 +72,14 @@ def compute_displacement_statistics(displacements: np.ndarray) -> tuple:
 def normalize_displacements(displacements: np.ndarray, disp_stats: tuple) -> np.ndarray:
     """
     Normalize displacements by training set statistics
+    
+    Args:
+        displacements: np.ndarray (N, nFrames-1, 2)
+            Displacements between frame pixel intensity centroids
+        disp_stats: tuple
+            Statistics of training set to normalize with
+    Returns:
+        Normalized displacements (N, nFrames-1, 2)
     """
     # Unpack stats
     dx_mean, dy_mean, dx_std, dy_std = disp_stats
@@ -51,9 +90,9 @@ def normalize_displacements(displacements: np.ndarray, disp_stats: tuple) -> np.
 
     return np.stack((dx_norm, dy_norm), axis=-1)
 
-def create_multi_state_displacements(p1: np.ndarray, p2: np.ndarray, theta: np.ndarray, N: int, T: int, dt: float):
+def create_multi_state_displacements(p1: np.ndarray, p2: np.ndarray, theta: np.ndarray, N: int, T: int, dt: float) -> np.ndarray:
     """
-    Create displacements for all time steps
+    Create displacements for all time steps and particles
 
     Args:
         p1: np.ndarray (N,T)
@@ -66,8 +105,8 @@ def create_multi_state_displacements(p1: np.ndarray, p2: np.ndarray, theta: np.n
             Number of trajectories to generate
         T: int
             Number of timesteps to simulate for each trajectory
-        dt: int/float
-            Timestep for simulation (now unitless and set to 1)
+        dt: float
+            Timestep for simulation (seconds)
     Returns:
         disp: np.ndarray(N,T,2)
             Displacements for each step in the simulations  
@@ -95,9 +134,9 @@ def create_multi_state_displacements(p1: np.ndarray, p2: np.ndarray, theta: np.n
 
     return disp
 
-def create_multi_state_trajectories(p1: np.ndarray, p2: np.ndarray, theta: np.ndarray, N: int, T: int, dt: float):
+def create_multi_state_trajectories(p1: np.ndarray, p2: np.ndarray, theta: np.ndarray, N: int, T: int, dt: float) -> np.ndarray:
     """
-    Create array of multi-state trajectories given diffusion parameters
+    Create multi-state trajectories given diffusion parameters
 
     Args:
         p1: np.ndarray (N,T)
@@ -106,14 +145,12 @@ def create_multi_state_trajectories(p1: np.ndarray, p2: np.ndarray, theta: np.nd
             Diffusion coefficient in second prinicipal component
         theta: np.ndarray (N,T)
             Angle w/ respect to x-axis, corresponding to the orientation of the first prinicipal component
-        fov: np.ndarray (2,)
-            Window size of imaging
         N: int
             Number of trajectories to generate
         T: int
             Number of timesteps to simulate for each trajectory
-        dt: int/float
-            Timestep for simulation (now unitless and set to 1)
+        dt: float
+            Timestep for simulation (seconds)
     Returns:
         pos: np.ndarray (N,T,2)
             Array containing the 2D trajectories
@@ -121,14 +158,12 @@ def create_multi_state_trajectories(p1: np.ndarray, p2: np.ndarray, theta: np.nd
     # Create displacements across all particles and time steps
     disp = create_multi_state_displacements(p1, p2, theta, N, T, dt)
 
-    # Get position trajectories
-    #pos_0 = np.random.uniform(fov[0]/4, 3*fov[0]/4, size=(N,2))
+    # Get position trajectories (here the starting point is interpreted as the first displacement for each trajectory)
     pos = np.cumsum(disp, axis=1) # shape: (N,T,2)
-    #pos += pos_0[:, None, :] # shift all positions by starting point
 
     return pos
     
-def create_displacements(p1: np.ndarray, p2: np.ndarray, theta: np.ndarray, N: int, T: int, dt: float):
+def create_displacements(p1: np.ndarray, p2: np.ndarray, theta: np.ndarray, N: int, T: int, dt: float) -> np.ndarray:
     """
     Create displacements for all time steps
 
@@ -143,10 +178,10 @@ def create_displacements(p1: np.ndarray, p2: np.ndarray, theta: np.ndarray, N: i
             Number of trajectories to generate
         T: int
             Number of timesteps to simulate for each trajectory
-        dt: int/float
-            Timestep for simulation (now unitless and set to 1)
+        dt: float
+            Timestep for simulation (seconds)
     Returns:
-        disp: np.ndarray(N,T,2)
+        disp: np.ndarray (N,T,2)
             Displacements for each step in the simulations  
     """
     # Create array with diffusion principal values for each trajectory
@@ -169,7 +204,7 @@ def create_displacements(p1: np.ndarray, p2: np.ndarray, theta: np.ndarray, N: i
 
     return disp
 
-def create_trajectories(p1: np.ndarray, p2: np.ndarray, theta: np.ndarray, N: int, T: int, dt: float):
+def create_trajectories(p1: np.ndarray, p2: np.ndarray, theta: np.ndarray, N: int, T: int, dt: float) -> np.ndarray:
     """
     Create array of trajectories given diffusion parameters
 
@@ -195,41 +230,35 @@ def create_trajectories(p1: np.ndarray, p2: np.ndarray, theta: np.ndarray, N: in
     # Create displacements across all particles and time steps
     disp = create_displacements(p1, p2, theta, N, T, dt)
 
-    # Get position trajectories
-    #pos_0 = np.random.uniform(fov[0]/4, 3*fov[0]/4, size=(N,2))
+    # Get position trajectories (here the starting point is interpreted as the first displacement for each trajectory)
     pos = np.cumsum(disp, axis=1) # shape: (N,T,2)
-    #pos += pos_0[:, None, :] # shift all positions by starting point
 
     return pos
     
-def create_training_set(N: int, T: int, image_props: dict, dt: float=0.001, fov: np.ndarray | None=None) -> tuple[np.ndarray, np.ndarray]:
+def create_training_set(N: int, T: int, image_props: dict, dt: float=0.001, is_isotropic: bool=False) -> tuple[np.ndarray, np.ndarray]:
     """
-    Creates new training data containing video frames of trajectories and labels for a given cycle of training
+    Creates videos from trajectory data and sampled labels
 
     Args:
         N: int
-            Number of trajectories to generate in a simulation
+            Number of trajectories to generate
         T: int
-            number of timesteps for each simulation
+            Number of timesteps for each simulation
         image_props: dict
             Parameters needed for simulation
-        dt: int
-            Time step to be used for the simulation
-        fov: np.ndarray
-            Gives fov for viewing a simulation trajectory and used for random starting point in trajectory
-         
+        dt: float
+            Time step to be used for the simulation (seconds)
+        is_isotropic: bool
+            Specifies whether to generate isotropic simulations  
     Returns:
-        videos: np.ndarray 
-                    Array of images for each trajectory
-        labels: np.ndarray
+        videos: np.ndarray (N, nFrames, W, H)
+                    Array containing a video for each trajectory
+        labels: np.ndarray (N, 3)
                     Array of labels for each trajectory generated 
     """
     # Generate random diffusion parameters
-    props = generate_diffusion_props(N, image_props['D_min'], image_props['D_max'], image_props['angle_max'], is_isotropic=False)
+    props = generate_diffusion_props(N, image_props['D_min'], image_props['D_max'], image_props['angle_max'], is_isotropic=is_isotropic)
     p1, p2, theta = props[:,0], props[:,1], props[:,2]
-
-    # if fov is None:
-    #     fov = np.array([128,128])
         
     # Create trajectories
     pos = create_trajectories(p1, p2, theta, N, T, dt)
@@ -241,36 +270,34 @@ def create_training_set(N: int, T: int, image_props: dict, dt: float=0.001, fov:
     
     return videos, labels
 
-def create_training_set_w_features(N: int, T: int, image_props: dict, dt: float=0.001, fov: np.ndarray | None=None) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+def create_training_set_w_features(N: int, T: int, image_props: dict, dt: float=0.001, is_isotropic: bool=False, normalize: bool=True) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
     """
-    Creates new training data containing video frames of trajectories and labels for a given cycle of training
+    Creates videos of trajectories, displacement between each pair of frames, and labels
 
     Args:
         N: int
-            Number of trajectories to generate in a simulation
+            Number of trajectories to generate
         T: int
-            number of timesteps for each simulation
+            Number of timesteps for each simulation
         image_props: dict
             Parameters needed for simulation
-        dt: int
-            Time step to be used for the simulation
-        fov: np.ndarray
-            Gives fov for viewing a simulation trajectory and used for random starting point in trajectory
-         
+        dt: float
+            Time step to be used for the simulation (seconds)
+        is_isotropic: bool
+            Specifies whether to generate isotropic simulations
+        normalize: bool
+            Specifies whether to normalize generated videos
     Returns:
-        videos: np.ndarray 
+        videos: np.ndarray (N, nFrames, W, H)
                     Array of images for each trajectory
-        displacements: np.ndarray
+        displacements: np.ndarray (N, nFrames-1, 2)
                     Array of displacements between each pair of frames
-        labels: np.ndarray
+        labels: np.ndarray (N, 3)
                     Array of labels for each trajectory generated 
     """
     # Generate random diffusion parameters
-    props = generate_diffusion_props(N, image_props['D_min'], image_props['D_max'], image_props['angle_max'], is_isotropic=False)
+    props = generate_diffusion_props(N, image_props['D_min'], image_props['D_max'], image_props['angle_max'], is_isotropic=is_isotropic)
     p1, p2, theta = props[:,0], props[:,1], props[:,2]
-
-    # if fov is None:
-    #     fov = np.array([0,0])
         
     # Create trajectories
     pos = create_trajectories(p1, p2, theta, N, T, dt)
@@ -278,7 +305,7 @@ def create_training_set_w_features(N: int, T: int, image_props: dict, dt: float=
     # Get labels
     labels = np.stack((p1,p2,theta), axis=-1) # shape: (N,3)
 
-    videos, centroids = trajectories_to_videos_and_centroids(pos, image_props)
+    videos, centroids = trajectories_to_videos_and_centroids(pos, image_props, normalize=normalize)
 
     # Calculate relative displacement using centroids
     _, nFrames, _ = centroids.shape
@@ -286,39 +313,34 @@ def create_training_set_w_features(N: int, T: int, image_props: dict, dt: float=
 
     return videos, displacement, labels
 
-def create_multi_state_dataset_w_features(N: int, T: int, image_props: dict, dt: float=0.001, fov: np.ndarray | None=None, binding: bool=False) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+def create_multi_state_dataset_w_features(N: int, T: int, image_props: dict, dt: float=0.001, binding: bool=False) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
     """
     Creates a new dataset for 2-state particle simulations
 
     Args:
         N: int
-            Number of trajectories to generate in a simulation
+            Number of trajectories to generate
         T: int
-            number of timesteps for each simulation
+            Number of timesteps for each simulation
         image_props: dict
             Parameters needed for simulation
-        dt: int
-            Time step to be used for the simulation
-        fov: np.ndarray
-            Gives fov for viewing a simulation trajectory and used for random starting point in trajectory
-         
+        dt: float
+            Time step to be used for the simulation (seconds)
+        binding: bool
+            Specifies whether to do binding/unbinding or isotropic two-state simulations
     Returns:
-        videos: np.ndarray 
+        videos: np.ndarray (N, nFrames, W, H)
                     Array of images for each trajectory
-        displacements: np.ndarray
+        displacements: np.ndarray (N, nFrames-1, 2)
                     Array of displacements between each pair of frames
-        labels: np.ndarray
+        labels: np.ndarray (N, nFrames, 3)
                     Array of labels for each trajectory generated 
     """
     # Generate random diffusion props for 1st state and 2nd state
     if not binding:
+        # Generate two isotropic states
         props_0 = generate_diffusion_props(N, image_props['D_min'], image_props['D_max'], image_props['angle_max'], is_isotropic=True)
         props_1 = generate_diffusion_props(N, image_props['D_min'], image_props['D_max'], image_props['angle_max'], is_isotropic=True)
-        
-        # alpha = np.random.uniform(0.1, 1, size=N)
-        # p1_1 = alpha*p1_0
-        # p2_1 = p1_1
-        # theta_1 = np.zeros(N)
     else:
         print("Creating a binding dataset")
         
@@ -340,7 +362,6 @@ def create_multi_state_dataset_w_features(N: int, T: int, image_props: dict, dt:
     p1_1, p2_1, theta_1 = props_1[:, 0], props_1[:, 1], props_1[:, 2]
    
     # Get random point to make transition between states
-    #T_0 = np.random.randint(T//6, 5*T//6, size=N)
     T_0 = np.random.randint(1, T, size=N)
 
     # Make time-varying diffusion properties
@@ -382,7 +403,7 @@ def create_multi_state_dataset_w_features(N: int, T: int, image_props: dict, dt:
     
     return videos, displacement, labels
 
-def gaussian_2d(xc, yc, sigma, grid_size, amplitude):
+def gaussian_2d(xc: float, yc: float, sigma: float, grid_size: int, amplitude: float):
     """
     Generates a 2D Gaussian point spread function (PSF) centered at a specified position.
 
@@ -407,15 +428,19 @@ def gaussian_2d(xc, yc, sigma, grid_size, amplitude):
 def get_props(image_props: dict) -> tuple:
     """
     Fetch image props from dictionary
+    
+    Args:
+        image_props: dict
+            Simulation properties dictionary
+    Returns:
+        Simulation props
     """
     nFrames = image_props['frames']
 
     resolution = image_props["resolution"]
-    traj_unit = image_props["trajectory_unit"]
 
     output_size = image_props["output_size"]
     upsampling_factor = image_props["upsampling_factor"]
-    #psf_div_factor = image_props["psf_division_factor"]
     
     # Psf diameter is computed as wavelenght/2NA according to:
     #https://www.sciencedirect.com/science/article/pii/S0005272819301380?via%3Dihub
@@ -423,7 +448,9 @@ def get_props(image_props: dict) -> tuple:
     # This source says fwhm = 0.51 * wavelength / NA
     #https://www.leica-microsystems.com/science-lab/life-science/microscope-resolution-concepts-factors-and-calculation/
     
-    #fwhm_psf = image_props["wavelength"] / 2 * image_props["NA"] / psf_div_factor # student's old code
+    # Old student's code
+    #psf_div_factor = image_props["psf_division_factor"]
+    #fwhm_psf = image_props["wavelength"] / 2 * image_props["NA"] / psf_div_factor
     #gaussian_sigma = upsampling_factor/resolution * (fwhm_psf/2.355)
     
     # direct fwhm equation
@@ -439,24 +466,22 @@ def get_props(image_props: dict) -> tuple:
     background_mean, background_std = image_props["background_intensity"][0],image_props["background_intensity"][1]
     nPosPerFrame = image_props['n_pos_per_frame']
 
-    return (nFrames, traj_unit, resolution, output_size, gaussian_sigma, poisson_noise, 
+    return (nFrames, resolution, output_size, gaussian_sigma, poisson_noise, 
         particle_mean, particle_std, background_mean, background_std, nPosPerFrame, upsampling_factor, gaussian_noise) 
 
 def trajectories_to_videos(pos: np.ndarray, image_props: dict) -> np.ndarray: 
     """
-    Transforms trajectory data into microscopy imagery data and centroid data
+    Transforms trajectory data into microscopy imagery data
 
     Args:
         pos: np.ndarray (N,T,2)
             Trajectory data for N particles across T timesteps in x,y dimensions
         nPosPerFrame: int
-            The number of trajectory points used to create one frame
+            The number of trajectory positions used to create one frame
         image_props: dict
             Dictionary containing the properties needed for image creation
     Returns:
         videos: np.ndarray (N, nFrames, output_size, output_size)
-
-    Andi simulation code 128x128 px^2 fov, dt=0.1s, D in px^2/frame, resolution of 100nm per pixel, D on the order of 0.01 um^2/s -> pixel size and framerate tell us D=0.1 px^2/ dt
     """
     # Get trajectory dimensions
     N, _, _ = pos.shape
@@ -465,13 +490,9 @@ def trajectories_to_videos(pos: np.ndarray, image_props: dict) -> np.ndarray:
     pos[:, :, 1] *= -1
 
     # Get imaging properties
-    (nFrames, traj_unit, resolution, output_size, gaussian_sigma, poisson_noise, 
+    (nFrames, resolution, output_size, gaussian_sigma, poisson_noise, 
         particle_mean, particle_std, background_mean, background_std, nPosPerFrame, upsampling_factor, gaussian_noise) = get_props(image_props)
     
-    # if(traj_unit !=-1 ):
-    #     # put the trajectory in pixels
-    #     pos = pos * traj_unit / (resolution* 1e9)
-
     # Convert from um to pixels assuming resolution in m
     pos = pos * 1e-6 / resolution
     
@@ -485,7 +506,7 @@ def trajectories_to_videos(pos: np.ndarray, image_props: dict) -> np.ndarray:
     
     return videos
 
-def trajectories_to_videos_and_centroids(pos: np.ndarray, image_props: dict) -> tuple[np.ndarray, np.ndarray]:
+def trajectories_to_videos_and_centroids(pos: np.ndarray, image_props: dict, normalize: bool=True) -> tuple[np.ndarray, np.ndarray]:
     """
     Transforms trajectory data into microscopy imagery data and centroid data
 
@@ -496,6 +517,8 @@ def trajectories_to_videos_and_centroids(pos: np.ndarray, image_props: dict) -> 
             The number of trajectory points used to create one frame
         image_props: dict
             Dictionary containing the properties needed for image creation
+        normalize: bool
+            Specifies whether to normalize generated videos
     Returns:
         videos: np.ndarray (N, nFrames, output_size, output_size)
         centroids: np.ndarray (N, nFrames, 2)
@@ -507,13 +530,9 @@ def trajectories_to_videos_and_centroids(pos: np.ndarray, image_props: dict) -> 
     pos[:, :, 1] *= -1
 
     # Get imaging properties
-    (nFrames, traj_unit, resolution, output_size, gaussian_sigma, poisson_noise, 
+    (nFrames, resolution, output_size, gaussian_sigma, poisson_noise, 
         particle_mean, particle_std, background_mean, background_std, nPosPerFrame, upsampling_factor, gaussian_noise) = get_props(image_props)
-
-    # if(traj_unit !=-1 ):
-    #     # put the trajectory in pixels
-    #     pos = pos * traj_unit / (resolution* 1e9)
-    
+        
     # Convert from um to pixels assuming resolution in m
     pos = pos * 1e-6 / resolution
     
@@ -524,13 +543,46 @@ def trajectories_to_videos_and_centroids(pos: np.ndarray, image_props: dict) -> 
         generate_video_vectorized(out_videos[n,:],pos[n,:],nFrames,output_size,upsampling_factor,nPosPerFrame,
                                             gaussian_sigma,particle_mean,particle_std,background_mean,background_std, poisson_noise, gaussian_noise, centroids[n,:])
     
-    videos = normalize_images(out_videos, background_mean, background_std, particle_mean + background_mean)
+    if normalize:
+        out_videos = normalize_images(out_videos, background_mean, background_std, particle_mean + background_mean)
     
-    return videos, centroids
+    return out_videos, centroids
 
 def generate_video(out_video: np.ndarray, trajectory: np.ndarray, nFrames: int, output_size: int, upsampling_factor: int, nPosPerFrame: int, 
                    gaussian_sigma: float, particle_mean: float, particle_std: float, background_mean: float, background_std: float, poisson_noise: int, gaussian_noise: bool, centroid: np.ndarray | None=None):
-    """Helper function of function above, all arguments documented above"""
+    """
+    Generate a video and centroid data if requested
+    
+    Args:
+        out_video: np.ndarray (nFrames, output_size, output_size)
+            Video to generate
+        trajectory: np.ndarray (T, 2)
+            Trajectory to use for video generation
+        nFrames: int
+            Number of frames to generate
+        output_size: int
+            Width/height of each frame in pixels
+        upsampling_factor: int
+            Factor for upsampling to first generate a higher resolution image before downsampling to final output size
+        nPosPerFrame: int
+            Number of positions in a trajectory to use for generating one frame
+        gaussian_sigma: float
+            Standard deviation of gaussian of imaging PSF. Generated from FWHM and pixel resolution
+        particle_mean: float
+            Experimentally defined value of mean particle intensity
+        particle_std: float
+            Experiementally defined value of std of particle intensity
+        background_mean: float
+            Experimentally defined value of mean background noise
+        background_std: float
+            Experimentally defined value of std of background noise
+        poisson_noise: int
+            Value used for generating Poisson noise, if -1 then no Poisson noise added
+        gaussian_noise: bool
+            Specifies whether to apply Gaussian noise
+        centroid: np.ndarray (nFrames, 2) | None
+            Centroid with respect to pixel intensity for each frame
+    """
     for f in range(nFrames):
         frame_hr = np.zeros(( output_size*upsampling_factor, output_size*upsampling_factor),np.float32)
         frame_lr = np.zeros((output_size, output_size),np.float32)
@@ -578,7 +630,7 @@ def generate_video(out_video: np.ndarray, trajectory: np.ndarray, nFrames: int, 
 def generate_video_vectorized(out_video: np.ndarray, trajectory: np.ndarray, nFrames: int, output_size: int, upsampling_factor: int, nPosPerFrame: int, 
                    gaussian_sigma: float, particle_mean: float, particle_std: float, background_mean: float, background_std: float, poisson_noise: int, gaussian_noise: bool, centroid: np.ndarray | None=None):
     """
-    Vectorized version of the above function
+    Vectorized version of the above function (same arguments). We only use this function in practice for efficiency
     """
     grid_size = output_size * upsampling_factor
 
@@ -625,7 +677,7 @@ def generate_video_vectorized(out_video: np.ndarray, trajectory: np.ndarray, nFr
         poisson = np.random.poisson(poisson_noise, size=frame_lr.shape) / poisson_noise
         frame_lr *= poisson
 
-    # Case where we want features for relative displacement between frames
+    # Case where we want features for displacement between frames
     if centroid is not None:
         limit = (output_size - 1) // 2
         x = np.linspace(-limit, limit, output_size)
@@ -641,7 +693,7 @@ def get_image_centroid(image: np.ndarray, grid_size: int) -> np.ndarray:
     Compute the intensity centroid of an image
 
     Args:
-        image: np.ndarray
+        image: np.ndarray (W, H)
             Input image to find intensity centroid of
         grid_size: int
             Size of grid/image
@@ -698,7 +750,7 @@ def normalize_images(images: np.ndarray, background_mean=None, background_sigma=
     
     return normalized
 
-def play_video(video, figsize=(5, 5), fps=5, vmin=None, vmax=None, save_path=None):
+def play_video(video, label: np.ndarray | None, figsize=(5, 5), fps=5, vmin=None, vmax=None, save_path=None):
     """
     Displays a stack of images as a video inside jupyter notebooks with consistent intensity scaling.
 
@@ -706,6 +758,8 @@ def play_video(video, figsize=(5, 5), fps=5, vmin=None, vmax=None, save_path=Non
     ----------
     video : ndarray
         Stack of images.
+    label : ndarray | None
+        Label for displaying in frame
     figsize : tuple, optional
         Canvas size of the video.
     fps : int, optional
@@ -714,13 +768,15 @@ def play_video(video, figsize=(5, 5), fps=5, vmin=None, vmax=None, save_path=Non
         Minimum intensity value for all frames. If None, will be automatically determined.
     vmax : float, optional
         Maximum intensity value for all frames. If None, will be automatically determined.
-
+    save_path: str, optional
+        Path for saving a video
     Returns
     -------
     Video object
         Returns a video player with input stack of images.
     """
-    fig = plt.figure(figsize=figsize)
+    #fig = plt.figure(figsize=figsize)
+    fig, ax = plt.subplots(figsize=figsize)
     images = []
 
     if(len(video.shape) == 3):
@@ -737,8 +793,43 @@ def play_video(video, figsize=(5, 5), fps=5, vmin=None, vmax=None, save_path=Non
 
     print(f"vmin: {vmin} vmax: {vmax} mean: {mean:.2f}")
 
-    for image in video:
-        images.append([plt.imshow(image[:, :, 0], cmap="gray", vmin=vmin, vmax=vmax)])
+    if label is not None:
+        label = np.repeat(label[np.newaxis, ...], video.shape[0], axis=0) if label.ndim == 1 else label
+
+    for i, image in enumerate(video):
+        img_artist = ax.imshow(
+            image[:, :, 0], 
+            cmap="gray", 
+            vmin=vmin, 
+            vmax=vmax
+        )
+        
+        if label is not None:
+            text_artist = ax.text(
+                0.01, 0.99,
+                f"Frame {i}",
+                color="yellow",
+                fontsize=10,
+                ha="left",
+                va="top",
+                transform=ax.transAxes,
+                bbox=dict(facecolor="black", alpha=0.5, pad=2)
+            )
+        
+            text_artist2 = ax.text(
+                0.52, 0.99,
+                rf"({label[i][0]:.2f} $\frac{{\mu m^2}}{{s}}$, {label[i][1]:.2f} $\frac{{\mu m^2}}{{s}}$, {np.rad2deg(label[i][-1]):.0f}°)",
+                color="yellow",
+                fontsize=10,
+                ha="left",
+                va="top",
+                transform=ax.transAxes,
+                bbox=dict(facecolor="black", alpha=0.5, pad=2)
+            )
+            
+            images.append([img_artist, text_artist, text_artist2])
+        else:
+            images.append([img_artist, text_artist])
 
     anim = animation.ArtistAnimation(
         fig, images, interval=1e3 / fps, blit=True, repeat_delay=0
